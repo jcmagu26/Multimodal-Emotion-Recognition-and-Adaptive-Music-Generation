@@ -107,6 +107,27 @@ main { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 32px 0
   border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0; display: none; }
 .spinner.visible { display: block; }
 @keyframes spin { to { transform: rotate(360deg); } }
+.camera-tabs { display: flex; border-bottom: 1px solid var(--border); }
+.tab-btn { flex: 1; padding: 10px 12px; background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--muted); font-family: var(--font-body); font-size: 10px; letter-spacing: 0.2em;
+  text-transform: uppercase; cursor: pointer; transition: all 0.2s; margin-bottom: -1px; }
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+.upload-body { padding: 20px; }
+.upload-drop { border: 1px dashed var(--border); border-radius: 8px; padding: 32px 20px;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  cursor: pointer; transition: all 0.2s; text-align: center; }
+.upload-drop:hover, .upload-drop.dragover { border-color: var(--accent); background: rgba(200,169,110,0.04); }
+.upload-drop-icon { font-size: 28px; opacity: 0.4; }
+.upload-drop-text { font-size: 11px; color: var(--muted); letter-spacing: 0.1em; }
+.upload-drop-hint { font-size: 10px; color: var(--border); letter-spacing: 0.05em; }
+#upload-file-input { display: none; }
+.upload-preview { width: 100%; aspect-ratio: 4/3; background: #050709; border-radius: 8px;
+  border: 1px solid var(--border); display: none; object-fit: cover; margin-bottom: 12px; }
+.upload-filename { font-size: 11px; color: var(--accent); letter-spacing: 0.05em;
+  padding: 6px 0; display: none; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
 .error-banner { display: none; grid-column: 1 / -1; background: rgba(200,110,110,0.08);
   border: 1px solid var(--danger); border-radius: 8px; padding: 12px 16px; font-size: 11px; color: var(--danger); }
 .error-banner.visible { display: block; }
@@ -125,14 +146,40 @@ footer { padding: 20px 0; border-top: 1px solid var(--border);
     <div class="card">
       <div class="card-header">
         <div class="dot" id="cam-dot"></div>
-        <span class="card-title">Camera Input</span>
+        <span class="card-title">Video Input</span>
       </div>
-      <div class="camera-body">
-        <video id="video-preview" autoplay muted playsinline></video>
-        <div class="camera-controls">
-          <button class="btn btn-primary" id="btn-start-cam">⬤ &nbsp;Start Camera</button>
-          <button class="btn btn-danger"  id="btn-record"    disabled>● &nbsp;Record Clip</button>
-          <button class="btn"             id="btn-analyze"   disabled>▶ &nbsp;Analyse</button>
+      <!-- Tab switcher -->
+      <div class="camera-tabs">
+        <button class="tab-btn active" id="tab-camera" onclick="switchTab('camera')">⬤ &nbsp;Camera</button>
+        <button class="tab-btn"        id="tab-upload" onclick="switchTab('upload')">↑ &nbsp;Upload</button>
+      </div>
+
+      <!-- Camera panel -->
+      <div class="tab-panel active" id="panel-camera">
+        <div class="camera-body">
+          <video id="video-preview" autoplay muted playsinline></video>
+          <div class="camera-controls">
+            <button class="btn btn-primary" id="btn-start-cam">⬤ &nbsp;Start Camera</button>
+            <button class="btn btn-danger"  id="btn-record"    disabled>● &nbsp;Record Clip</button>
+            <button class="btn"             id="btn-analyze"   disabled>▶ &nbsp;Analyse</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Upload panel -->
+      <div class="tab-panel" id="panel-upload">
+        <div class="upload-body">
+          <video id="upload-preview" class="upload-preview" muted playsinline controls></video>
+          <div class="upload-drop" id="upload-drop" onclick="document.getElementById('upload-file-input').click()">
+            <div class="upload-drop-icon">↑</div>
+            <div class="upload-drop-text">Drop a video file here or click to browse</div>
+            <div class="upload-drop-hint">MP4 · MOV · WEBM · AVI — max ~200 MB</div>
+          </div>
+          <input type="file" id="upload-file-input" accept="video/*" />
+          <div class="upload-filename" id="upload-filename"></div>
+          <div class="camera-controls" style="margin-top:12px;">
+            <button class="btn btn-primary" id="btn-analyze-upload" disabled>▶ &nbsp;Analyse Upload</button>
+          </div>
         </div>
       </div>
     </div>
@@ -244,9 +291,15 @@ const paramInstr   = document.getElementById("param-instr");
 const trackTitle   = document.getElementById("track-title");
 const progressFill = document.getElementById("progress-fill");
 const waveCanvas   = document.getElementById("waveform-canvas");
+const uploadDrop     = document.getElementById("upload-drop");
+const uploadInput    = document.getElementById("upload-file-input");
+const uploadPreview  = document.getElementById("upload-preview");
+const uploadFilename = document.getElementById("upload-filename");
+const btnAnalyzeUp   = document.getElementById("btn-analyze-upload");
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let stream = null, mediaRecorder = null, recordedChunks = [], recordedBlob = null;
+let uploadedBlob = null;
 let scheduledNotes = [], toneBpm = 120;
 let synth = null, chordSynth = null, bassSynth = null;
 let isPlaying = false, playStartTime = 0, playDuration = 0, rafId = null;
@@ -374,6 +427,79 @@ function updateEmotionUI(valence, arousal, scale, tempo, label) {
   paramMode.textContent  = scaleLabels[scale]  || scale;
   paramInstr.textContent = instruments[scale]  || "Piano";
 }
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function switchTab(tab) {
+  document.getElementById("tab-camera").classList.toggle("active", tab === "camera");
+  document.getElementById("tab-upload").classList.toggle("active", tab === "upload");
+  document.getElementById("panel-camera").classList.toggle("active", tab === "camera");
+  document.getElementById("panel-upload").classList.toggle("active", tab === "upload");
+  clearError();
+  setStatus(tab === "camera" ? "Camera mode — record a clip to analyse."
+                             : "Upload mode — drop or select a video file.", "idle");
+}
+
+// ── Upload handling ───────────────────────────────────────────────────────────
+function handleUploadedFile(file) {
+  if (!file || !file.type.startsWith("video/")) {
+    showError("Please select a valid video file (MP4, MOV, WEBM, AVI)."); return;
+  }
+  uploadedBlob = file;
+  const url = URL.createObjectURL(file);
+  uploadPreview.src      = url;
+  uploadPreview.style.display = "block";
+  uploadDrop.style.display    = "none";
+  uploadFilename.textContent  = file.name + " (" + (file.size / 1024 / 1024).toFixed(1) + " MB)";
+  uploadFilename.style.display = "block";
+  btnAnalyzeUp.disabled = false;
+  camDot.className = "dot active";
+  setStatus("File ready: " + file.name + ". Click Analyse Upload.", "success");
+}
+
+uploadInput.addEventListener("change", () => {
+  if (uploadInput.files[0]) handleUploadedFile(uploadInput.files[0]);
+});
+
+uploadDrop.addEventListener("dragover",  e => { e.preventDefault(); uploadDrop.classList.add("dragover"); });
+uploadDrop.addEventListener("dragleave", () => uploadDrop.classList.remove("dragover"));
+uploadDrop.addEventListener("drop", e => {
+  e.preventDefault(); uploadDrop.classList.remove("dragover");
+  if (e.dataTransfer.files[0]) handleUploadedFile(e.dataTransfer.files[0]);
+});
+
+btnAnalyzeUp.addEventListener("click", async () => {
+  if (!uploadedBlob) return;
+  clearError();
+  setStatus("Uploading and analysing video…", "loading");
+  btnAnalyzeUp.disabled = true; btnPlay.disabled = true;
+
+  const formData = new FormData();
+  // Send as the file's original type so ffmpeg can decode it
+  formData.append("video", uploadedBlob, uploadedBlob.name || "upload.mp4");
+
+  try {
+    const res = await fetch(API_BASE + "/generate", { method: "POST", body: formData });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || res.statusText);
+    }
+    const data = await res.json();
+    const { valence, arousal, scale, tempo_bpm, emotion_label, midi_b64 } = data;
+    updateEmotionUI(valence, arousal, scale, tempo_bpm, emotion_label);
+
+    const binary = atob(midi_b64);
+    const bytes  = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const midiBlob = new Blob([bytes], { type: "audio/midi" });
+
+    await loadMidi(midiBlob, emotion_label, scale, tempo_bpm);
+    btnAnalyzeUp.disabled = false;
+    setStatus("Analysis complete. Press ▶ to play.", "success");
+  } catch (e) {
+    showError("Analysis failed: " + e.message);
+    btnAnalyzeUp.disabled = false;
+  }
+});
 
 // ── MIDI parser ───────────────────────────────────────────────────────────────
 function parseMidi(bytes) {
