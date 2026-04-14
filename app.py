@@ -170,22 +170,57 @@ RIGHT_EYE_LEFT, RIGHT_EYE_RIGHT = 362, 263
 LEFT_BROW_INNER  = 107
 RIGHT_BROW_INNER = 336
 
+# Additional landmark indices for valence-sensitive features (must match
+# video_feature_extraction.py exactly)
+MOUTH_CORNER_LEFT  = 61
+MOUTH_CORNER_RIGHT = 291
+UPPER_LIP_CENTER   = 13
+LOWER_LIP_CENTER   = 14
+LEFT_CHEEK         = 234
+RIGHT_CHEEK        = 454
+NOSE_TIP           = 4
+
 
 def _euclidean(p1, p2):
     return np.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2)
 
 
 def _landmark_features(lm):
-    mar = _euclidean(lm[MOUTH_TOP],  lm[MOUTH_BOTTOM]) / (
-          _euclidean(lm[MOUTH_LEFT], lm[MOUTH_RIGHT])  + 1e-6)
+    """Mirrors compute_landmark_features() in video_feature_extraction.py exactly."""
+    mouth_width = _euclidean(lm[MOUTH_LEFT], lm[MOUTH_RIGHT])
+
+    mar = _euclidean(lm[MOUTH_TOP], lm[MOUTH_BOTTOM]) / (mouth_width + 1e-6)
+
     l_ear = _euclidean(lm[LEFT_EYE_TOP],  lm[LEFT_EYE_BOTTOM])  / (
             _euclidean(lm[LEFT_EYE_LEFT], lm[LEFT_EYE_RIGHT])   + 1e-6)
     r_ear = _euclidean(lm[RIGHT_EYE_TOP], lm[RIGHT_EYE_BOTTOM]) / (
             _euclidean(lm[RIGHT_EYE_LEFT],lm[RIGHT_EYE_RIGHT])  + 1e-6)
     ear   = (l_ear + r_ear) / 2.0
+
     brow  = (_euclidean(lm[LEFT_BROW_INNER],  lm[LEFT_EYE_LEFT]) +
              _euclidean(lm[RIGHT_BROW_INNER], lm[RIGHT_EYE_RIGHT])) / 2.0
-    return {"mar": mar, "ear": ear, "brow_raise": brow}
+
+    # smile_ratio: lip corners rise above lip centre in a smile
+    lip_center_y = (lm[UPPER_LIP_CENTER].y + lm[LOWER_LIP_CENTER].y) / 2.0
+    corner_y_avg = (lm[MOUTH_CORNER_LEFT].y + lm[MOUTH_CORNER_RIGHT].y) / 2.0
+    smile_ratio  = (lip_center_y - corner_y_avg) / (mouth_width + 1e-6)
+
+    # cheek_raise: Duchenne smile — cheeks lift above nose tip
+    nose_y      = lm[NOSE_TIP].y
+    cheek_y_avg = (lm[LEFT_CHEEK].y + lm[RIGHT_CHEEK].y) / 2.0
+    cheek_raise = nose_y - cheek_y_avg
+
+    # brow_furrow: inner brows converge in anger/sadness/fear
+    brow_furrow = _euclidean(lm[LEFT_BROW_INNER], lm[RIGHT_BROW_INNER])
+
+    return {
+        "mar":         mar,
+        "ear":         ear,
+        "brow_raise":  brow,
+        "smile_ratio": smile_ratio,
+        "cheek_raise": cheek_raise,
+        "brow_furrow": brow_furrow,
+    }
 
 
 def extract_features(video_path: str, audio_path: str) -> dict:
@@ -198,7 +233,7 @@ def extract_features(video_path: str, audio_path: str) -> dict:
               f'"{audio_path}" -y -loglevel quiet')
 
     y, sr = librosa.load(audio_path, sr=None)
-    audio_duration = len(y) / sr   # seconds — used for speaking rate
+    audio_duration = len(y) / sr
 
     mfccs       = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
     mfccs_mean  = np.mean(mfccs, axis=1)
@@ -215,18 +250,62 @@ def extract_features(video_path: str, audio_path: str) -> dict:
     pitch_range  = float(np.max(pitch_voiced) - np.min(pitch_voiced)) if len(pitch_voiced) > 0 else 0.0
     voiced_ratio = len(pitch_voiced) / (len(pitch) + 1e-6)
 
-    rms          = librosa.feature.rms(y=y)
-    energy_mean  = float(np.mean(rms))
-    energy_std   = float(np.std(rms))
+    rms         = librosa.feature.rms(y=y)
+    energy_mean = float(np.mean(rms))
+    energy_std  = float(np.std(rms))
 
     spec_centroid  = float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)))
     spec_bandwidth = float(np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr)))
     spec_rolloff   = float(np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr)))
     zcr            = float(np.mean(librosa.feature.zero_crossing_rate(y)))
 
+    # ── NEW valence-specific audio features (must match video_feature_extraction.py) ──
+
+    # Harmonics-to-Noise Ratio
+    harmonic          = librosa.effects.harmonic(y)
+    percussive        = librosa.effects.percussive(y)
+    harmonic_energy   = float(np.mean(harmonic   ** 2) + 1e-10)
+    percussive_energy = float(np.mean(percussive ** 2) + 1e-10)
+    hnr               = float(10 * np.log10(harmonic_energy / percussive_energy))
+
+    # Spectral flatness
+    spec_flatness      = librosa.feature.spectral_flatness(y=y)
+    spec_flatness_mean = float(np.mean(spec_flatness))
+    spec_flatness_std  = float(np.std(spec_flatness))
+
+    # Chroma features
+    chroma      = librosa.feature.chroma_stft(y=y, sr=sr)
+    chroma_mean = np.mean(chroma, axis=1)   # 12 values
+    chroma_std  = float(np.std(chroma_mean))
+    chroma_max  = float(np.max(chroma_mean))
+    chroma_entropy = float(
+        -np.sum(chroma_mean / (chroma_mean.sum() + 1e-10) *
+                np.log(chroma_mean / (chroma_mean.sum() + 1e-10) + 1e-10))
+    )
+
+    # Mel-spectrogram summary
+    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=40)
+    mel_db   = librosa.power_to_db(mel_spec, ref=np.max)
+    mel_mean = float(np.mean(mel_db))
+    mel_std  = float(np.std(mel_db))
+    mel_skew = float(np.mean(((mel_db - mel_mean) / (mel_std + 1e-10)) ** 3))
+
+    # Pitch slope (rising = happy, falling = sad)
+    if len(pitch_voiced) > 1:
+        t           = np.linspace(0, 1, len(pitch_voiced))
+        pitch_slope = float(np.polyfit(t, pitch_voiced, 1)[0])
+    else:
+        pitch_slope = 0.0
+
+    # Jitter (cycle-to-cycle F0 variation)
+    if len(pitch_voiced) > 2:
+        jitter = float(np.mean(np.abs(np.diff(pitch_voiced))) / (pitch_mean + 1e-6))
+    else:
+        jitter = 0.0
+
     # ── Visual ─────────────────────────────────────────────────────────────
-    cap           = cv2.VideoCapture(video_path)
-    frame_feats   = []
+    cap         = cv2.VideoCapture(video_path)
+    frame_feats = []
 
     while True:
         ret, frame = cap.read()
@@ -241,42 +320,68 @@ def extract_features(video_path: str, audio_path: str) -> dict:
 
     if frame_feats:
         ff = pd.DataFrame(frame_feats)
-        face_detected  = 1.0
-        face_mar_mean  = float(ff["mar"].mean())
-        face_mar_std   = float(ff["mar"].std())
-        face_ear_mean  = float(ff["ear"].mean())
-        face_ear_std   = float(ff["ear"].std())
-        face_brow_mean = float(ff["brow_raise"].mean())
-        face_brow_std  = float(ff["brow_raise"].std())
+        face_detected    = 1.0
+        face_mar_mean    = float(ff["mar"].mean())
+        face_mar_std     = float(ff["mar"].std())
+        face_ear_mean    = float(ff["ear"].mean())
+        face_ear_std     = float(ff["ear"].std())
+        face_brow_mean   = float(ff["brow_raise"].mean())
+        face_brow_std    = float(ff["brow_raise"].std())
+        face_smile_mean  = float(ff["smile_ratio"].mean())
+        face_smile_std   = float(ff["smile_ratio"].std())
+        face_cheek_mean  = float(ff["cheek_raise"].mean())
+        face_cheek_std   = float(ff["cheek_raise"].std())
+        face_furrow_mean = float(ff["brow_furrow"].mean())
+        face_furrow_std  = float(ff["brow_furrow"].std())
     else:
-        face_detected  = 0.0
-        face_mar_mean  = face_mar_std  = 0.0
-        face_ear_mean  = face_ear_std  = 0.0
-        face_brow_mean = face_brow_std = 0.0
+        face_detected    = 0.0
+        face_mar_mean    = face_mar_std    = 0.0
+        face_ear_mean    = face_ear_std    = 0.0
+        face_brow_mean   = face_brow_std   = 0.0
+        face_smile_mean  = face_smile_std  = 0.0
+        face_cheek_mean  = face_cheek_std  = 0.0
+        face_furrow_mean = face_furrow_std = 0.0
 
     return {
         **{f"mfcc_mean_{i+1}":   float(mfccs_mean[i])  for i in range(13)},
         **{f"mfcc_std_{i+1}":    float(mfccs_std[i])   for i in range(13)},
         **{f"mfcc_delta_{i+1}":  float(delta_mean[i])  for i in range(13)},
         **{f"mfcc_delta2_{i+1}": float(delta2_mean[i]) for i in range(13)},
-        "pitch_mean":   pitch_mean,   "pitch_std":   pitch_std,
+        "pitch_mean":   pitch_mean,   "pitch_std":    pitch_std,
         "pitch_range":  pitch_range,  "voiced_ratio": voiced_ratio,
         "energy_mean":  energy_mean,  "energy_std":   energy_std,
         "spec_centroid":  spec_centroid,
         "spec_bandwidth": spec_bandwidth,
         "spec_rolloff":   spec_rolloff,
         "zcr":            zcr,
+        # NEW audio features
+        "hnr":                hnr,
+        "spec_flatness_mean": spec_flatness_mean,
+        "spec_flatness_std":  spec_flatness_std,
+        "chroma_std":         chroma_std,
+        "chroma_max":         chroma_max,
+        "chroma_entropy":     chroma_entropy,
+        **{f"chroma_mean_{i+1}": float(chroma_mean[i]) for i in range(12)},
+        "mel_mean":    mel_mean,
+        "mel_std":     mel_std,
+        "mel_skew":    mel_skew,
+        "pitch_slope": pitch_slope,
+        "jitter":      jitter,
+        # Visual features (original)
         "face_detected":  face_detected,
         "face_mar_mean":  face_mar_mean,  "face_mar_std":  face_mar_std,
         "face_ear_mean":  face_ear_mean,  "face_ear_std":  face_ear_std,
         "face_brow_mean": face_brow_mean, "face_brow_std": face_brow_std,
-        # Text features — populated separately via Whisper in app routes
-        # (filled with zeros here; routes call transcribe_and_extract directly)
+        # NEW visual features
+        "face_smile_mean":  face_smile_mean,  "face_smile_std":  face_smile_std,
+        "face_cheek_mean":  face_cheek_mean,  "face_cheek_std":  face_cheek_std,
+        "face_furrow_mean": face_furrow_mean, "face_furrow_std": face_furrow_std,
+        # Text features — overwritten after Whisper runs in the route handlers
         "text_has_transcript": 0.0, "text_word_count": 0.0,
-        "text_speaking_rate": 0.0,  "text_exclamation_ratio": 0.0,
+        "text_speaking_rate":  0.0, "text_exclamation_ratio": 0.0,
         "text_question_ratio": 0.0, "text_lex_valence": 0.0,
-        "text_lex_valence_std": 0.0,"text_sentiment_words": 0.0,
-        "text_avg_sent_length": 0.0,"text_caps_ratio": 0.0,
+        "text_lex_valence_std":0.0, "text_sentiment_words": 0.0,
+        "text_avg_sent_length":0.0, "text_caps_ratio": 0.0,
         "_audio_duration": audio_duration,   # pass-through, stripped before predict
     }
 
@@ -587,16 +692,157 @@ def midi_to_wav(midi_bytes: bytes, soundfont: str = SOUNDFONT_PATH) -> bytes:
         return b""
 
 
-def emotion_label(scale: str, valence: float, arousal: float) -> str:
-    labels = {
-        ("major", True):  "Happy",
-        ("major", False): "Content",
-        ("dorian", True): "Hopeful",
-        ("dorian",False): "Pensive",
-        ("minor", True):  "Tense",
-        ("minor", False): "Melancholic",
-    }
-    return labels.get((scale, arousal >= 0.45), "Neutral")
+# ─────────────────────────────────────────────────────────────────────────────
+# Rule-based acoustic signal  (bypasses model uncertainty)
+# ─────────────────────────────────────────────────────────────────────────────
+# When the MLP is uncertain (outputs near its mean), raw acoustic features
+# still carry clear emotional signal. We compute a lightweight rule-based
+# estimate and blend it with the model output so obvious emotions always land.
+
+# Blend weight: how much the rule-based signal contributes (0=model only, 1=rules only)
+_RULE_BLEND = 0.45
+
+def _rule_based_va(feats: dict):
+    """
+    Derive (valence, arousal) directly from acoustic/visual features.
+    Weights calibrated against real CREMA-D clip debug output.
+
+    Key signals confirmed from data:
+      HNR:         -3.45 (angry) vs +2.59 (happy)  — strongest valence signal
+      pitch_slope: -15.8 (angry) vs +5.93 (happy)  — falling=negative, rising=positive
+      face_smile:   0.00 (angry) vs +0.11 (happy)  — clear visual discriminator
+      energy/zcr:  slightly higher for angry        — arousal signal
+    """
+    energy   = feats.get("energy_mean",      0.0)
+    zcr      = feats.get("zcr",              0.0)
+    pitch_s  = feats.get("pitch_std",        0.0)
+    pitch_sl = feats.get("pitch_slope",      0.0)
+    hnr      = feats.get("hnr",              0.0)
+    smile    = feats.get("face_smile_mean",  0.0)
+    furrow   = feats.get("face_furrow_mean", 0.0)
+    text_v   = feats.get("text_lex_valence", 0.0)
+
+    # ── Arousal ───────────────────────────────────────────────────────────────
+    e_score   = float(np.clip(energy / 0.015, 0, 1))   # 0.015 RMS ≈ loud speech
+    zcr_score = float(np.clip(zcr    / 0.12,  0, 1))   # 0.12 ≈ energetic
+    ps_score  = float(np.clip(pitch_s/ 80.0,  0, 1))   # 80 Hz std ≈ expressive
+    raw_arousal = e_score*0.50 + zcr_score*0.30 + ps_score*0.20
+    raw_arousal = 0.017 + raw_arousal * (0.74 - 0.017)
+
+    # ── Valence ───────────────────────────────────────────────────────────────
+    # HNR: ±8 dB maps to ±1  (confirmed: -3.45 angry, +2.59 happy)
+    hnr_score   = float(np.clip(hnr / 8.0, -1, 1))
+    # pitch_slope: ±20 Hz/s maps to ±1  (confirmed: -15.8 angry, +5.9 happy)
+    slope_score = float(np.clip(pitch_sl / 20.0, -1, 1))
+    # smile: 0.1 unit → 0.6 score  (confirmed: 0.0 angry, 0.11 happy)
+    smile_score = float(np.clip(smile * 6, -1, 1))
+    # furrow: deviation from neutral 0.048 baseline
+    furrow_score= float(np.clip(-(furrow - 0.048) * 30, -1, 1))
+
+    raw_valence = (hnr_score   * 0.40 +
+                   slope_score * 0.30 +
+                   smile_score * 0.20 +
+                   furrow_score* 0.10)
+    raw_valence = float(np.clip(raw_valence * 0.70, -0.665, 0.712))
+
+    # Stretch to display space for label
+    v = _stretch_valence(raw_valence)
+    a = max(_stretch_arousal(raw_arousal), _AROUSAL_FLOOR)
+    if abs(text_v) > 0.1:
+        v = v * (1 - _TEXT_VALENCE_BLEND) + text_v * _TEXT_VALENCE_BLEND
+    v = float(np.clip(v, -1, 1))
+    a = float(np.clip(a,  0, 1))
+    return raw_valence, raw_arousal, emotion_label(v, a)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-prediction sensitivity layer
+# ─────────────────────────────────────────────────────────────────────────────
+# Two different strategies for the two dimensions:
+#
+# VALENCE — tanh stretch centered on the true training median (-0.04).
+#   Percentile ladders failed here because CREMA-D valence clusters near 0 and
+#   the segment boundaries pushed the median into positive territory.
+#   tanh(x/scale) gives a smooth S-curve: median→0, ±1 std→±0.65, extremes→±1.
+#
+# AROUSAL — percentile ladder normalisation.
+#   Works well because arousal has a clear low-skewed shape we can map onto
+#   equal-occupancy buckets. P75 raised to 0.42 so average clips land in MID.
+
+_V_CENTER = -0.04   # true median of raw valence output (from training distribution)
+_V_SCALE  =  0.32   # approx 1 std of raw valence; controls how fast tanh saturates
+
+_A_PCTS = [0.017, 0.06, 0.13, 0.22, 0.42, 0.74]   # p0,p10,p25,p50,p75,p100
+_A_CONTRAST = 0.92  # cubic exponent inside each segment (1.0=linear, lower=more contrast)
+
+_AROUSAL_FLOOR = 0.15          # never report arousal below this
+_TEXT_VALENCE_BLEND = 0.30     # how much Whisper sentiment shifts valence
+
+
+def _stretch_valence(rv: float) -> float:
+    """tanh S-curve centered on training median. Neutral raw → ~0 stretched."""
+    t = (rv - _V_CENTER) / (_V_SCALE + 1e-9)
+    return float(np.clip(np.tanh(t * 0.9), -1.0, 1.0))
+
+
+def _stretch_arousal(ra: float) -> float:
+    """Percentile ladder: maps training distribution onto equal-width [0,1] buckets."""
+    bp = _A_PCTS
+    n  = len(bp) - 1
+    for i in range(n):
+        if ra <= bp[i + 1] or i == n - 1:
+            lo, hi = bp[i], bp[i + 1]
+            t = float(np.clip((ra - lo) / (hi - lo + 1e-9), 0.0, 1.0))
+            t = float(np.sign(t - 0.5) * (abs(t - 0.5) ** _A_CONTRAST) + 0.5)
+            seg_lo = i / n
+            seg_hi = (i + 1) / n
+            return float(np.clip(seg_lo + t * (seg_hi - seg_lo), 0.0, 1.0))
+    return 1.0
+
+
+def stretch_va(raw_valence: float, raw_arousal: float,
+               text_lex_valence: float = 0.0, feats: dict = None):
+    v = _stretch_valence(raw_valence)
+    a = max(_stretch_arousal(raw_arousal), _AROUSAL_FLOOR)
+
+    # Blend rule-based signal to correct for model mean-regression
+    if feats is not None:
+        rb_v_raw, rb_a_raw, _ = _rule_based_va(feats)
+        rb_v = _stretch_valence(rb_v_raw)
+        rb_a = max(_stretch_arousal(rb_a_raw), _AROUSAL_FLOOR)
+        v = v * (1 - _RULE_BLEND) + rb_v * _RULE_BLEND
+        a = a * (1 - _RULE_BLEND) + rb_a * _RULE_BLEND
+
+    # Blend Whisper sentiment into valence when speech content is clear
+    if abs(text_lex_valence) > 0.1:
+        v = v * (1 - _TEXT_VALENCE_BLEND) + text_lex_valence * _TEXT_VALENCE_BLEND
+
+    v = float(np.clip(v, -1.0, 1.0))
+    a = float(np.clip(a,  0.0,  1.0))
+    print(f"  [stretch] raw=({raw_valence:+.3f}, {raw_arousal:.3f})  "
+          f"text_v={text_lex_valence:+.2f}  → ({v:+.3f}, {a:.3f})")
+    return v, a
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Emotion label — 3×3 grid, balanced thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+
+def emotion_label(valence: float, arousal: float) -> str:
+    """
+        arousal↑   neg-val      neu-val    pos-val
+        high        Angry        Tense      Excited
+        mid         Sad          Neutral    Happy
+        low         Melancholic  Calm       Content
+    """
+    v_bin = "pos" if valence >  0.15 else ("neg" if valence < -0.15 else "neu")
+    a_bin = "hi"  if arousal >  0.65 else ("lo"  if arousal <  0.32  else "mid")
+
+    return {
+        ("pos", "hi"): "Excited",     ("pos", "mid"): "Happy",   ("pos", "lo"): "Content",
+        ("neu", "hi"): "Tense",       ("neu", "mid"): "Neutral",  ("neu", "lo"): "Calm",
+        ("neg", "hi"): "Angry",       ("neg", "mid"): "Sad",      ("neg", "lo"): "Melancholic",
+    }[(v_bin, a_bin)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,6 +852,74 @@ def emotion_label(scale: str, valence: float, arousal: float) -> str:
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/debug", methods=["POST"])
+def debug():
+    """POST a video and get raw model outputs + all key feature values."""
+    if "video" not in request.files:
+        return jsonify({"error": "No video file"}), 400
+    try:
+        _load_models()
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 500
+
+    video_file = request.files["video"]
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = os.path.join(tmp, "clip.webm")
+        audio_path = os.path.join(tmp, "clip.wav")
+        video_file.save(video_path)
+        feats = extract_features(video_path, audio_path)
+        duration = feats.pop("_audio_duration", 5.0)
+        feats.update(transcribe_and_extract(audio_path, duration))
+
+        row = np.array([[feats.get(k, 0.0) for k in _feature_cols]], dtype=np.float32)
+        row_scaled = _scaler.transform(row)
+
+        with torch.no_grad():
+            t       = torch.tensor(row_scaled).to(_torch_device)
+            shared  = _va_model.shared(t)
+            v_raw   = float(_va_model.valence_head(shared).cpu().item())
+            a_logit = float(_va_model.arousal_head(shared).cpu().item())
+            a_raw   = float(torch.sigmoid(_va_model.arousal_head(shared)).cpu().item())
+
+        # Compute rule-based signal for comparison
+        rb_v, rb_a, rb_label = _rule_based_va(feats)
+        sv, sa = stretch_va(v_raw, a_raw, feats.get("text_lex_valence", 0.0))
+
+    return jsonify({
+        # Model outputs
+        "raw_valence":        round(v_raw,   4),
+        "raw_arousal":        round(a_raw,   4),
+        "arousal_logit":      round(a_logit, 4),
+        "stretched_valence":  round(sv, 4),
+        "stretched_arousal":  round(sa, 4),
+        "model_label":        emotion_label(sv, sa),
+        # Rule-based override for comparison
+        "rule_valence":       round(rb_v, 4),
+        "rule_arousal":       round(rb_a, 4),
+        "rule_label":         rb_label,
+        # Key acoustic features — are these varying between clips?
+        "energy_mean":        round(feats.get("energy_mean",      0), 6),
+        "energy_std":         round(feats.get("energy_std",       0), 6),
+        "pitch_mean":         round(feats.get("pitch_mean",       0), 2),
+        "pitch_std":          round(feats.get("pitch_std",        0), 2),
+        "zcr":                round(feats.get("zcr",              0), 5),
+        "hnr":                round(feats.get("hnr",              0), 3),
+        "spec_centroid":      round(feats.get("spec_centroid",    0), 1),
+        "jitter":             round(feats.get("jitter",           0), 5),
+        "pitch_slope":        round(feats.get("pitch_slope",      0), 3),
+        # Visual features
+        "face_detected":      feats.get("face_detected", 0),
+        "face_smile_mean":    round(feats.get("face_smile_mean",  0), 4),
+        "face_furrow_mean":   round(feats.get("face_furrow_mean", 0), 4),
+        # Text
+        "text_lex_valence":   round(feats.get("text_lex_valence", 0), 3),
+        # Sanity
+        "feature_count":      len(_feature_cols),
+        "nonzero_features":   int(np.count_nonzero(row[0])),
+        "audio_duration_s":   round(duration, 2),
+    })
 
 
 @app.route("/predict", methods=["POST"])
@@ -646,11 +960,11 @@ def predict():
         row_scaled = _scaler.transform(row_data)
         with torch.no_grad():
             pred = _va_model(torch.tensor(row_scaled).to(_torch_device)).cpu().numpy()[0]
-        valence = float(np.clip(pred[0], -1.0, 1.0))
-        arousal = float(np.clip(pred[1],  0.0, 1.0))
-        scale    = _va_to_scale(valence)
+        raw_v = float(np.clip(pred[0], -1.0, 1.0))
+        raw_a = float(np.clip(pred[1],  0.0, 1.0))
+        valence, arousal = stretch_va(raw_v, raw_a, feats.get("text_lex_valence", 0.0), feats)
         tempo    = _va_to_tempo(arousal)
-        label    = emotion_label(scale, valence, arousal)
+        label    = emotion_label(valence, arousal)
 
     return jsonify({
         "valence":       round(valence, 4),
@@ -698,12 +1012,12 @@ def generate():
         row_scaled = _scaler.transform(row_data)
         with torch.no_grad():
             pred = _va_model(torch.tensor(row_scaled).to(_torch_device)).cpu().numpy()[0]
-        valence = float(np.clip(pred[0], -1.0, 1.0))
-        arousal = float(np.clip(pred[1],  0.0, 1.0))
-
+        raw_v = float(np.clip(pred[0], -1.0, 1.0))
+        raw_a = float(np.clip(pred[1],  0.0, 1.0))
+        valence, arousal = stretch_va(raw_v, raw_a, feats.get("text_lex_valence", 0.0), feats)
     scale = _va_to_scale(valence)
     tempo = _va_to_tempo(arousal)
-    label = emotion_label(scale, valence, arousal)
+    label = emotion_label(valence, arousal)
 
     midi_bytes = generate_midi(valence, arousal, num_bars=8)
     import base64
