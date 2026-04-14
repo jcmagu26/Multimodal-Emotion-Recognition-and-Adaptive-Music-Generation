@@ -35,8 +35,11 @@ WITH_TEXT_CSV    = os.path.join(BASE_DIR, "video_features_with_text.csv")
 WITHOUT_TEXT_CSV = os.path.join(BASE_DIR, "video_features.csv")
 MODEL_DIR        = os.path.join(os.path.dirname(__file__), "models")
 
-EPOCHS = 150; BATCH_SIZE = 64; LR = 3e-4; HIDDEN = [256, 128, 64]
+EPOCHS = 200; BATCH_SIZE = 64; LR = 3e-4; HIDDEN = [256, 128, 64]
 RANDOM_SEED = 42
+# Arousal weight: 1.5 is enough to break mean-collapse without driving the
+# sigmoid head into negative saturation (which 3.0 caused → arousal=0 always).
+AROUSAL_LOSS_WEIGHT = 1.5
 torch.manual_seed(RANDOM_SEED); np.random.seed(RANDOM_SEED)
 
 device = torch.device("mps"  if torch.backends.mps.is_available()  else
@@ -58,6 +61,10 @@ df = pd.read_csv(features_csv)
 print(f"Shape: {df.shape}")
 print(f"Valence [{df['valence'].min():.3f}, {df['valence'].max():.3f}]  "
       f"Arousal [{df['arousal'].min():.3f}, {df['arousal'].max():.3f}]")
+print(f"Arousal mean={df['arousal'].mean():.3f}  std={df['arousal'].std():.3f}")
+print(f"Arousal distribution:\n  low(<0.35): {(df['arousal']<0.35).sum()}  "
+      f"mid(0.35-0.65): {((df['arousal']>=0.35)&(df['arousal']<=0.65)).sum()}  "
+      f"high(>0.65): {(df['arousal']>0.65).sum()}")
 
 # ── Feature columns ───────────────────────────────────────────────────────────
 
@@ -71,13 +78,26 @@ all_cols    = audio_cols + visual_cols + text_cols
 print(f"Audio: {len(audio_cols)}  Visual: {len(visual_cols)}  "
       f"Text: {len(text_cols)}  Total: {len(all_cols)}")
 
-# ── Oversample positive/neutral valence ───────────────────────────────────────
+# ── Oversample under-represented regions ─────────────────────────────────────
+# Valence: positive clips are rare in CREMA-D (mostly negative emotions)
+# Arousal: high-arousal clips need boosting so the model doesn't predict the mean
 
-positive = df[df['valence'] > 0.2]
-neutral  = df[(df['valence'] >= -0.1) & (df['valence'] <= 0.2)]
-df = pd.concat([df, positive, positive, positive, neutral, neutral],
-               ignore_index=True).sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
-print(f"After resampling: {len(df)} clips")
+positive     = df[df['valence'] > 0.2]
+neutral_val  = df[(df['valence'] >= -0.1) & (df['valence'] <= 0.2)]
+high_arousal = df[df['arousal'] > 0.65]   # angry/fearful/excited — high energy
+low_arousal  = df[df['arousal'] < 0.35]   # sad/calm — model tends to ignore these too
+
+df = pd.concat(
+    [df,
+     positive,    positive,    positive,   # 4x positive valence
+     neutral_val, neutral_val,             # 3x neutral valence
+     high_arousal,high_arousal,            # 3x high arousal
+     low_arousal,                          # 2x low arousal
+    ],
+    ignore_index=True
+).sample(frac=1, random_state=RANDOM_SEED).reset_index(drop=True)
+print(f"After resampling: {len(df)} clips  "
+      f"(arousal mean={df['arousal'].mean():.3f}  std={df['arousal'].std():.3f})")
 
 X = df[all_cols].values.astype(np.float32)
 Y = df[['valence', 'arousal']].values.astype(np.float32)
@@ -115,21 +135,29 @@ def train_model(X_tr, Y_tr, X_va, Y_va):
     model     = VAPredictor(X_tr.shape[1], HIDDEN).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, EPOCHS, 1e-5)
-    criterion = nn.MSELoss()
+
+    # Weighted MSE: arousal column gets AROUSAL_LOSS_WEIGHT× more gradient signal.
+    # Without this the model finds it easier to predict arousal ≈ mean (~0.5) and
+    # minimise overall MSE, producing the flat-arousal behaviour you observed.
+    loss_weights = torch.tensor([1.0, AROUSAL_LOSS_WEIGHT], device=device)
+
+    def weighted_mse(pred, target):
+        sq_err = (pred - target) ** 2          # (batch, 2)
+        return (sq_err * loss_weights).mean()
 
     dl      = DataLoader(TensorDataset(torch.tensor(X_tr), torch.tensor(Y_tr)),
                          BATCH_SIZE, shuffle=True)
     X_va_t  = torch.tensor(X_va).to(device)
     Y_va_t  = torch.tensor(Y_va).to(device)
 
-    best_loss, best_state, patience, no_imp = 1e9, None, 20, 0
+    best_loss, best_state, patience, no_imp = 1e9, None, 30, 0
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
         for xb, yb in dl:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            loss = weighted_mse(model(xb), yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -137,7 +165,7 @@ def train_model(X_tr, Y_tr, X_va, Y_va):
 
         model.eval()
         with torch.no_grad():
-            vl = criterion(model(X_va_t), Y_va_t).item()
+            vl = weighted_mse(model(X_va_t), Y_va_t).item()
 
         if vl < best_loss:
             best_loss  = vl
@@ -147,8 +175,14 @@ def train_model(X_tr, Y_tr, X_va, Y_va):
             no_imp += 1
 
         if epoch % 25 == 0:
+            with torch.no_grad():
+                pv = model(X_va_t).cpu().numpy()
+                # Check for arousal saturation: if std < 0.02 the head is dead
+                a_std = pv[:,1].std()
+                sat_warning = " ⚠ AROUSAL SATURATED" if a_std < 0.02 else ""
             print(f"  epoch {epoch:3d}  val_loss={vl:.4f}  "
-                  f"lr={scheduler.get_last_lr()[0]:.1e}")
+                  f"arousal_pred [min={pv[:,1].min():.3f} max={pv[:,1].max():.3f} std={a_std:.3f}]"
+                  f"  lr={scheduler.get_last_lr()[0]:.1e}{sat_warning}")
         if no_imp >= patience:
             print(f"  Early stop at epoch {epoch}"); break
 
@@ -184,6 +218,10 @@ with torch.no_grad():
 
 print(f"\n  Test valence RMSE: {np.sqrt(mean_squared_error(Y_test[:,0], tp[:,0])):.4f}")
 print(f"  Test arousal RMSE: {np.sqrt(mean_squared_error(Y_test[:,1], tp[:,1])):.4f}")
+print(f"  Arousal pred range: [{tp[:,1].min():.3f}, {tp[:,1].max():.3f}]  "
+      f"std={tp[:,1].std():.3f}  (training std={Y_test[:,1].std():.3f})")
+print(f"  Valence pred range: [{tp[:,0].min():.3f}, {tp[:,0].max():.3f}]  "
+      f"std={tp[:,0].std():.3f}  (training std={Y_test[:,0].std():.3f})")
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
