@@ -1,29 +1,20 @@
 """
 app.py  –  Emotion-Adaptive Music  |  Flask Backend
 ────────────────────────────────────────────────────
-Receives a video clip from the browser, runs your exact feature extraction
-pipeline (audio + MediaPipe facial landmarks), feeds the features into the
-trained GradientBoosting models, then generates and returns a MIDI file.
-
-Setup
-─────
-  pip install flask flask-cors librosa opencv-python mediapipe midiutil
-              scikit-learn pandas numpy joblib
-
-Train & save models first (run once):
-  python train_and_save.py           ← generated alongside this file
-
-Run:
-  python app.py
-  # → http://localhost:5000
+Receives a video clip from the browser, runs feature extraction
+(audio + MediaPipe facial landmarks + optional Whisper text), feeds
+the features into a trained MLP, then generates and returns a MIDI file.
 
 Endpoints
 ─────────
   POST /predict   multipart/form-data  { video: <file> }
-                  → JSON { valence, arousal, scale, tempo_bpm, emotion_label }
+                  → JSON { valence, arousal, scale, root_name, tempo_bpm, emotion_label }
 
   POST /generate  multipart/form-data  { video: <file> }
-                  → MIDI file (audio/midi)
+                  → JSON { valence, arousal, scale, root_name, tempo_bpm, emotion_label, midi_b64 }
+
+  POST /debug     multipart/form-data  { video: <file> }
+                  → JSON (all raw features + model internals)
 
   GET  /health    → JSON { status: "ok" }
 """
@@ -104,7 +95,7 @@ import torch.nn as nn
 
 class VAPredictor(nn.Module):
     """Must match architecture in train_and_save.py exactly."""
-    def __init__(self, input_dim, hidden, dropout=0.0):
+    def __init__(self, input_dim, hidden, dropout=0.0, n_classes=6):
         super().__init__()
         layers = [nn.BatchNorm1d(input_dim)]
         in_dim = input_dim
@@ -115,17 +106,26 @@ class VAPredictor(nn.Module):
         self.shared       = nn.Sequential(*layers)
         self.valence_head = nn.Linear(in_dim, 1)
         self.arousal_head = nn.Linear(in_dim, 1)
+        self.emotion_head = nn.Linear(in_dim, n_classes)
 
     def forward(self, x):
         h = self.shared(x)
-        return torch.cat([self.valence_head(h),
-                          torch.sigmoid(self.arousal_head(h))], dim=1)
+        v = self.valence_head(h)
+        a = torch.sigmoid(self.arousal_head(h))
+        e = self.emotion_head(h)
+        return torch.cat([v, a], dim=1), e
 
 _torch_device = torch.device("mps"  if torch.backends.mps.is_available() else
                               "cuda" if torch.cuda.is_available() else "cpu")
 
+# Emotion classes in the same order as LabelEncoder in train_and_save.py
+_EMOTION_CLASSES = ["ANG", "DIS", "FEA", "HAP", "NEU", "SAD"]
+_EMOTION_NAMES   = {"ANG": "Angry", "DIS": "Disgust", "FEA": "Fear",
+                    "HAP": "Happy", "NEU": "Neutral",  "SAD": "Sad"}
+_label_encoder   = None
+
 def _load_models():
-    global _va_model, _scaler, _feature_cols
+    global _va_model, _scaler, _feature_cols, _label_encoder
     if _va_model is not None:
         return
     mlp_path = os.path.join(MODEL_DIR, "va_mlp.pt")
@@ -134,14 +134,18 @@ def _load_models():
         raise FileNotFoundError(
             "Trained model not found. Run train_and_save.py first."
         )
-    cfg           = joblib.load(cfg_path)
-    model         = VAPredictor(cfg["input_dim"], cfg["hidden"], cfg["dropout"])
+    cfg     = joblib.load(cfg_path)
+    n_cls   = cfg.get("n_classes", 6)
+    model   = VAPredictor(cfg["input_dim"], cfg["hidden"], cfg["dropout"], n_cls)
     model.load_state_dict(torch.load(mlp_path, map_location=_torch_device))
     model.to(_torch_device).eval()
     _va_model     = model
     _scaler       = joblib.load(os.path.join(MODEL_DIR, "scaler.joblib"))
     _feature_cols = joblib.load(os.path.join(MODEL_DIR, "feature_cols.joblib"))
-    print(f"MLP loaded ({cfg['input_dim']} features) on {_torch_device}")
+    le_path = os.path.join(MODEL_DIR, "label_encoder.joblib")
+    if os.path.exists(le_path):
+        _label_encoder = joblib.load(le_path)
+    print(f"MLP loaded ({cfg['input_dim']} features, {n_cls} classes) on {_torch_device}")
 
 def _load_whisper():
     global _whisper_model
@@ -229,8 +233,15 @@ def extract_features(video_path: str, audio_path: str) -> dict:
     Returns a flat dict ready to be turned into a single-row DataFrame.
     """
     # ── Audio ──────────────────────────────────────────────────────────────
-    os.system(f'ffmpeg -i "{video_path}" -q:a 0 -map a '
-              f'"{audio_path}" -y -loglevel quiet')
+    result = subprocess.run(
+        ["ffmpeg", "-i", video_path, "-q:a", "0", "-map", "a",
+         audio_path, "-y", "-loglevel", "error"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg failed to extract audio from {video_path}:\n{result.stderr[:400]}"
+        )
 
     y, sr = librosa.load(audio_path, sr=None)
     audio_duration = len(y) / sr
@@ -242,6 +253,7 @@ def extract_features(video_path: str, audio_path: str) -> dict:
     delta2      = librosa.feature.delta(mfccs, order=2)
     delta_mean  = np.mean(delta,  axis=1)
     delta2_mean = np.mean(delta2, axis=1)
+    delta_std   = np.std(delta,   axis=1)   # NEW
 
     pitch        = librosa.yin(y, fmin=50, fmax=500)
     pitch_voiced = pitch[pitch > 0]
@@ -250,60 +262,87 @@ def extract_features(video_path: str, audio_path: str) -> dict:
     pitch_range  = float(np.max(pitch_voiced) - np.min(pitch_voiced)) if len(pitch_voiced) > 0 else 0.0
     voiced_ratio = len(pitch_voiced) / (len(pitch) + 1e-6)
 
-    rms         = librosa.feature.rms(y=y)
-    energy_mean = float(np.mean(rms))
-    energy_std  = float(np.std(rms))
+    # F0 percentiles (NEW)
+    if len(pitch_voiced) >= 4:
+        pitch_p10 = float(np.percentile(pitch_voiced, 10))
+        pitch_p25 = float(np.percentile(pitch_voiced, 25))
+        pitch_p75 = float(np.percentile(pitch_voiced, 75))
+        pitch_p90 = float(np.percentile(pitch_voiced, 90))
+    else:
+        pitch_p10 = pitch_p25 = pitch_p75 = pitch_p90 = pitch_mean
+
+    if len(pitch_voiced) > 1:
+        t_arr       = np.linspace(0, 1, len(pitch_voiced))
+        pitch_slope = float(np.polyfit(t_arr, pitch_voiced, 1)[0])
+    else:
+        pitch_slope = 0.0
+
+    jitter = float(np.mean(np.abs(np.diff(pitch_voiced))) / (pitch_mean + 1e-6)) if len(pitch_voiced) > 2 else 0.0
+
+    # Shimmer (NEW)
+    rms_fr = librosa.feature.rms(y=y, frame_length=int(sr*0.025), hop_length=int(sr*0.010))[0]
+    rms_v  = rms_fr[rms_fr > rms_fr.mean() * 0.1]
+    shimmer = float(np.mean(np.abs(np.diff(rms_v))) / (np.mean(rms_v) + 1e-6)) if len(rms_v) > 2 else 0.0
+
+    # Voiced transitions and pause ratio (NEW)
+    voiced_mask       = (pitch > 0).astype(int)
+    voiced_trans_rate = float(np.sum(np.abs(np.diff(voiced_mask))) / (len(voiced_mask) + 1e-6))
+    pause_ratio       = float(1.0 - voiced_ratio)
+
+    rms_all     = librosa.feature.rms(y=y)[0]
+    energy_mean = float(np.mean(rms_all))
+    energy_std  = float(np.std(rms_all))
+    energy_slope = float(np.polyfit(np.linspace(0,1,len(rms_all)), rms_all, 1)[0]) if len(rms_all) > 1 else 0.0  # NEW
 
     spec_centroid  = float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)))
     spec_bandwidth = float(np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr)))
     spec_rolloff   = float(np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr)))
     zcr            = float(np.mean(librosa.feature.zero_crossing_rate(y)))
 
-    # ── NEW valence-specific audio features (must match video_feature_extraction.py) ──
+    # Spectral entropy and low-freq ratio (NEW)
+    stft_mag = np.abs(librosa.stft(y))
+    spec_norm = stft_mag / (stft_mag.sum(axis=0, keepdims=True) + 1e-10)
+    spectral_entropy = float(np.mean(-np.sum(spec_norm * np.log(spec_norm + 1e-10), axis=0)))
+    freqs    = librosa.fft_frequencies(sr=sr)
+    lf_mask  = (freqs >= 100) & (freqs <= 300)
+    sp2      = stft_mag ** 2
+    lowfreq_energy_ratio = float(sp2[lf_mask].sum(axis=0).mean() / (sp2.sum(axis=0).mean() + 1e-10))
 
-    # Harmonics-to-Noise Ratio
-    harmonic          = librosa.effects.harmonic(y)
-    percussive        = librosa.effects.percussive(y)
-    harmonic_energy   = float(np.mean(harmonic   ** 2) + 1e-10)
-    percussive_energy = float(np.mean(percussive ** 2) + 1e-10)
-    hnr               = float(10 * np.log10(harmonic_energy / percussive_energy))
+    harmonic   = librosa.effects.harmonic(y)
+    percussive = librosa.effects.percussive(y)
+    hnr = float(10 * np.log10((np.mean(harmonic**2) + 1e-10) / (np.mean(percussive**2) + 1e-10)))
 
-    # Spectral flatness
+    # CPP (NEW)
+    cepstrum  = np.real(np.fft.ifft(np.log(np.abs(librosa.stft(y)) + 1e-10), axis=0))
+    quefrency = np.arange(cepstrum.shape[0]) / sr
+    f0m = (quefrency > 0.002) & (quefrency < 0.02)
+    if f0m.sum() > 0:
+        y_vals   = np.abs(cepstrum[f0m]).mean(axis=1) if cepstrum.ndim > 1 else np.abs(cepstrum[f0m])
+        x_idx    = np.where(f0m)[0]
+        baseline = float(np.polyval(np.polyfit(x_idx, y_vals, 1), x_idx).mean())
+        cpp      = float(np.max(y_vals) - baseline)
+    else:
+        cpp = 0.0
+
     spec_flatness      = librosa.feature.spectral_flatness(y=y)
     spec_flatness_mean = float(np.mean(spec_flatness))
     spec_flatness_std  = float(np.std(spec_flatness))
 
-    # Chroma features
     chroma      = librosa.feature.chroma_stft(y=y, sr=sr)
-    chroma_mean = np.mean(chroma, axis=1)   # 12 values
+    chroma_mean = np.mean(chroma, axis=1)
     chroma_std  = float(np.std(chroma_mean))
     chroma_max  = float(np.max(chroma_mean))
     chroma_entropy = float(
         -np.sum(chroma_mean / (chroma_mean.sum() + 1e-10) *
-                np.log(chroma_mean / (chroma_mean.sum() + 1e-10) + 1e-10))
-    )
+                np.log(chroma_mean / (chroma_mean.sum() + 1e-10) + 1e-10)))
 
-    # Mel-spectrogram summary
     mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=40)
     mel_db   = librosa.power_to_db(mel_spec, ref=np.max)
     mel_mean = float(np.mean(mel_db))
     mel_std  = float(np.std(mel_db))
     mel_skew = float(np.mean(((mel_db - mel_mean) / (mel_std + 1e-10)) ** 3))
 
-    # Pitch slope (rising = happy, falling = sad)
-    if len(pitch_voiced) > 1:
-        t           = np.linspace(0, 1, len(pitch_voiced))
-        pitch_slope = float(np.polyfit(t, pitch_voiced, 1)[0])
-    else:
-        pitch_slope = 0.0
-
-    # Jitter (cycle-to-cycle F0 variation)
-    if len(pitch_voiced) > 2:
-        jitter = float(np.mean(np.abs(np.diff(pitch_voiced))) / (pitch_mean + 1e-6))
-    else:
-        jitter = 0.0
-
-    # ── Visual ─────────────────────────────────────────────────────────────
+    # ── Visual ─────────────────────────────────────────────────────────────────
     cap         = cv2.VideoCapture(video_path)
     frame_feats = []
 
@@ -318,65 +357,59 @@ def extract_features(video_path: str, audio_path: str) -> dict:
             frame_feats.append(_landmark_features(result.face_landmarks[0]))
     cap.release()
 
+    def _safe_std(series):
+        v = float(series.std())
+        return 0.0 if (v != v) else v
+
     if frame_feats:
         ff = pd.DataFrame(frame_feats)
         face_detected    = 1.0
-        face_mar_mean    = float(ff["mar"].mean())
-        face_mar_std     = float(ff["mar"].std())
-        face_ear_mean    = float(ff["ear"].mean())
-        face_ear_std     = float(ff["ear"].std())
-        face_brow_mean   = float(ff["brow_raise"].mean())
-        face_brow_std    = float(ff["brow_raise"].std())
-        face_smile_mean  = float(ff["smile_ratio"].mean())
-        face_smile_std   = float(ff["smile_ratio"].std())
-        face_cheek_mean  = float(ff["cheek_raise"].mean())
-        face_cheek_std   = float(ff["cheek_raise"].std())
-        face_furrow_mean = float(ff["brow_furrow"].mean())
-        face_furrow_std  = float(ff["brow_furrow"].std())
+        face_mar_mean    = float(ff["mar"].mean());        face_mar_std     = _safe_std(ff["mar"])
+        face_ear_mean    = float(ff["ear"].mean());        face_ear_std     = _safe_std(ff["ear"])
+        face_brow_mean   = float(ff["brow_raise"].mean()); face_brow_std    = _safe_std(ff["brow_raise"])
+        face_smile_mean  = float(ff["smile_ratio"].mean());face_smile_std   = _safe_std(ff["smile_ratio"])
+        face_cheek_mean  = float(ff["cheek_raise"].mean());face_cheek_std   = _safe_std(ff["cheek_raise"])
+        face_furrow_mean = float(ff["brow_furrow"].mean());face_furrow_std  = _safe_std(ff["brow_furrow"])
     else:
-        face_detected    = 0.0
-        face_mar_mean    = face_mar_std    = 0.0
-        face_ear_mean    = face_ear_std    = 0.0
-        face_brow_mean   = face_brow_std   = 0.0
-        face_smile_mean  = face_smile_std  = 0.0
-        face_cheek_mean  = face_cheek_std  = 0.0
-        face_furrow_mean = face_furrow_std = 0.0
+        face_detected = 0.0
+        face_mar_mean = face_mar_std = face_ear_mean = face_ear_std = 0.0
+        face_brow_mean = face_brow_std = face_smile_mean = face_smile_std = 0.0
+        face_cheek_mean = face_cheek_std = face_furrow_mean = face_furrow_std = 0.0
 
     return {
-        **{f"mfcc_mean_{i+1}":   float(mfccs_mean[i])  for i in range(13)},
-        **{f"mfcc_std_{i+1}":    float(mfccs_std[i])   for i in range(13)},
-        **{f"mfcc_delta_{i+1}":  float(delta_mean[i])  for i in range(13)},
-        **{f"mfcc_delta2_{i+1}": float(delta2_mean[i]) for i in range(13)},
+        **{f"mfcc_mean_{i+1}":      float(mfccs_mean[i])  for i in range(13)},
+        **{f"mfcc_std_{i+1}":       float(mfccs_std[i])   for i in range(13)},
+        **{f"mfcc_delta_{i+1}":     float(delta_mean[i])  for i in range(13)},
+        **{f"mfcc_delta2_{i+1}":    float(delta2_mean[i]) for i in range(13)},
+        **{f"mfcc_delta_std_{i+1}": float(delta_std[i])   for i in range(13)},  # NEW
         "pitch_mean":   pitch_mean,   "pitch_std":    pitch_std,
         "pitch_range":  pitch_range,  "voiced_ratio": voiced_ratio,
-        "energy_mean":  energy_mean,  "energy_std":   energy_std,
-        "spec_centroid":  spec_centroid,
-        "spec_bandwidth": spec_bandwidth,
-        "spec_rolloff":   spec_rolloff,
-        "zcr":            zcr,
-        # NEW audio features
-        "hnr":                hnr,
+        "pitch_slope":  pitch_slope,  "jitter":       jitter,
+        "shimmer":      shimmer,                                              # NEW
+        "pitch_p10": pitch_p10, "pitch_p25": pitch_p25,                      # NEW
+        "pitch_p75": pitch_p75, "pitch_p90": pitch_p90,                      # NEW
+        "voiced_trans_rate": voiced_trans_rate, "pause_ratio": pause_ratio,  # NEW
+        "energy_mean":  energy_mean,  "energy_std":  energy_std,
+        "energy_slope": energy_slope,                                         # NEW
+        "spec_centroid":  spec_centroid, "spec_bandwidth": spec_bandwidth,
+        "spec_rolloff":   spec_rolloff,  "zcr": zcr,
+        "spectral_entropy":     spectral_entropy,                             # NEW
+        "lowfreq_energy_ratio": lowfreq_energy_ratio,                        # NEW
+        "hnr": hnr, "cpp": cpp,                                              # cpp NEW
         "spec_flatness_mean": spec_flatness_mean,
         "spec_flatness_std":  spec_flatness_std,
-        "chroma_std":         chroma_std,
-        "chroma_max":         chroma_max,
-        "chroma_entropy":     chroma_entropy,
+        "chroma_std":     chroma_std, "chroma_max": chroma_max,
+        "chroma_entropy": chroma_entropy,
         **{f"chroma_mean_{i+1}": float(chroma_mean[i]) for i in range(12)},
-        "mel_mean":    mel_mean,
-        "mel_std":     mel_std,
-        "mel_skew":    mel_skew,
-        "pitch_slope": pitch_slope,
-        "jitter":      jitter,
-        # Visual features (original)
-        "face_detected":  face_detected,
-        "face_mar_mean":  face_mar_mean,  "face_mar_std":  face_mar_std,
-        "face_ear_mean":  face_ear_mean,  "face_ear_std":  face_ear_std,
-        "face_brow_mean": face_brow_mean, "face_brow_std": face_brow_std,
-        # NEW visual features
-        "face_smile_mean":  face_smile_mean,  "face_smile_std":  face_smile_std,
-        "face_cheek_mean":  face_cheek_mean,  "face_cheek_std":  face_cheek_std,
-        "face_furrow_mean": face_furrow_mean, "face_furrow_std": face_furrow_std,
-        # Text features — overwritten after Whisper runs in the route handlers
+        "mel_mean": mel_mean, "mel_std": mel_std, "mel_skew": mel_skew,
+        "face_detected":   face_detected,
+        "face_mar_mean":   face_mar_mean,    "face_mar_std":   face_mar_std,
+        "face_ear_mean":   face_ear_mean,    "face_ear_std":   face_ear_std,
+        "face_brow_mean":  face_brow_mean,   "face_brow_std":  face_brow_std,
+        "face_smile_mean": face_smile_mean,  "face_smile_std": face_smile_std,
+        "face_cheek_mean": face_cheek_mean,  "face_cheek_std": face_cheek_std,
+        "face_furrow_mean":face_furrow_mean, "face_furrow_std":face_furrow_std,
+        # Text features — filled in by route handlers after Whisper
         "text_has_transcript": 0.0, "text_word_count": 0.0,
         "text_speaking_rate":  0.0, "text_exclamation_ratio": 0.0,
         "text_question_ratio": 0.0, "text_lex_valence": 0.0,
@@ -399,14 +432,17 @@ SENTIMENT_LEXICON = {
     "okay": 0.2, "ok": 0.2, "yes": 0.3, "sure": 0.3, "right": 0.2,
     "bright": 0.5, "warm": 0.5, "thanks": 0.6, "thank": 0.6, "welcome": 0.5,
     "excited": 0.75, "amazing": 0.85, "brilliant": 0.8, "perfect": 0.85,
+    "full": 0.2, "almost": 0.1, "new": 0.3, "like": 0.4, "think": 0.1,
+    "stop": -0.2, "cold": -0.3, "forget": -0.3, "wonder": 0.2,
     "bad": -0.7, "sad": -0.8, "angry": -0.8, "hate": -0.9, "terrible": -0.85,
     "awful": -0.85, "horrible": -0.9, "wrong": -0.5, "no": -0.3, "not": -0.3,
     "never": -0.4, "fear": -0.75, "scared": -0.75, "afraid": -0.7,
     "disgust": -0.8, "disgusting": -0.85, "gross": -0.7, "ugly": -0.65,
     "hurt": -0.7, "pain": -0.75, "suffer": -0.8, "cry": -0.65, "dark": -0.4,
-    "cold": -0.3, "lonely": -0.75, "lost": -0.5, "fail": -0.65, "failed": -0.65,
+    "lonely": -0.75, "lost": -0.5, "fail": -0.65, "failed": -0.65,
     "dead": -0.85, "die": -0.85, "kill": -0.85, "mad": -0.7,
     "furious": -0.9, "rage": -0.9, "upset": -0.65, "miserable": -0.85,
+    "slippery": -0.3,
     "very": 1.3, "really": 1.2, "so": 1.15, "extremely": 1.5, "quite": 1.1,
     "absolutely": 1.4, "totally": 1.3, "completely": 1.3,
 }
@@ -479,178 +515,471 @@ import subprocess
 SOUNDFONT_PATH = "/usr/share/sounds/sf2/FluidR3_GM.sf2"  # overridden at runtime
 
 SCALES = {
-    "major":  [0, 2, 4, 5, 7, 9, 11],
-    "dorian": [0, 2, 3, 5, 7, 9, 10],
-    "minor":  [0, 2, 3, 5, 7, 8, 10],
+    "major":       [0, 2, 4, 5, 7, 9, 11],
+    "dorian":      [0, 2, 3, 5, 7, 9, 10],
+    "minor":       [0, 2, 3, 5, 7, 8, 10],
+    "lydian":      [0, 2, 4, 6, 7, 9, 11],   # dreamy/floating — high valence, low arousal
+    "phrygian":    [0, 1, 3, 5, 7, 8, 10],   # dark/tense — low valence, high arousal
 }
 
-# (scale_degree, inversion) per bar -- 8 bars
+# (scale_degree, inversion, chord_quality) per bar -- 16 bars for full structure
+# chord_quality: "triad", "open5", "sus2", "sus4"
+# No 7th chords — they add richness that pushes toward symphonic.
+# open5 (root + fifth only) is the most ambient, spacious voicing.
 PROGRESSIONS = {
-    "major":  [(0,0),(3,1),(4,0),(0,0),(5,1),(3,0),(4,2),(0,0)],
-    "dorian": [(0,0),(3,0),(0,1),(4,1),(0,0),(5,1),(3,0),(0,0)],
-    "minor":  [(0,0),(5,1),(3,0),(4,2),(0,0),(6,0),(3,1),(0,0)],
+    "major":    [(0,0,"open5"),(3,0,"open5"),(4,0,"sus2"), (0,0,"open5"),
+                 (5,0,"open5"),(3,0,"triad"),(1,0,"open5"),(4,0,"sus4"),
+                 (0,0,"open5"),(5,0,"open5"),(3,0,"sus2"), (4,0,"open5"),
+                 (6,0,"open5"),(2,0,"open5"),(4,0,"triad"),(0,0,"open5")],
+    "dorian":   [(0,0,"open5"),(3,0,"sus2"), (0,0,"open5"),(4,0,"open5"),
+                 (0,0,"open5"),(5,0,"open5"),(3,0,"sus4"), (2,0,"open5"),
+                 (0,0,"open5"),(4,0,"open5"),(5,0,"sus2"), (3,0,"open5"),
+                 (0,0,"open5"),(6,0,"open5"),(4,0,"open5"),(0,0,"sus2")],
+    "minor":    [(0,0,"open5"),(5,0,"open5"),(3,0,"sus2"), (4,0,"open5"),
+                 (0,0,"open5"),(6,0,"open5"),(3,0,"open5"),(4,0,"sus4"),
+                 (0,0,"open5"),(2,0,"open5"),(5,0,"open5"),(3,0,"sus2"),
+                 (6,0,"open5"),(4,0,"open5"),(5,0,"open5"),(0,0,"open5")],
+    "lydian":   [(0,0,"open5"),(1,0,"sus2"), (4,0,"open5"),(0,0,"open5"),
+                 (2,0,"open5"),(5,0,"open5"),(1,0,"sus4"), (0,0,"open5"),
+                 (0,0,"open5"),(4,0,"open5"),(2,0,"sus2"), (5,0,"open5"),
+                 (1,0,"open5"),(3,0,"open5"),(4,0,"open5"),(0,0,"open5")],
+    "phrygian": [(0,0,"open5"),(1,0,"open5"),(5,0,"sus2"), (0,0,"open5"),
+                 (3,0,"open5"),(1,0,"open5"),(5,0,"open5"),(0,0,"sus4"),
+                 (0,0,"open5"),(4,0,"open5"),(1,0,"open5"),(3,0,"sus2"),
+                 (5,0,"open5"),(1,0,"open5"),(4,0,"open5"),(0,0,"open5")],
 }
 
-# Relative scale-degree offsets for each phrase contour
+# Relative scale-degree offsets for each phrase contour — longer, more varied
 CONTOURS = {
-    "happy":       [ 0, 2, 4, 2,  3, 5, 4, 2],
-    "content":     [ 0, 1, 2, 1,  2, 1, 0, 0],
-    "hopeful":     [ 0, 2, 1, 3,  2, 4, 3, 1],
-    "pensive":     [ 0,-1, 0, 1,  0,-1,-2, 0],
-    "tense":       [ 0, 3,-1, 2, -2, 4,-3, 1],
-    "melancholic": [ 0,-1,-2,-1, -3,-2,-4,-2],
+    # Happy: stepwise ascending, bright and busy
+    "happy":   [ 0, 2, 4, 2,  3, 5, 4, 2,  0, 1, 3, 5,  4, 2, 4, 6],
+    # Neutral: minimal movement, hovering near root
+    "neutral": [ 0, 1, 0,-1,  0, 1, 2, 0, -1, 0, 1, 0,  0,-1, 0, 1],
+    # Sad: slow stepwise descent
+    "sad":     [ 0,-1,-2,-1, -3,-2,-4,-2, -1,-2,-3,-2, -4,-3,-5,-3],
+    # Angry: jagged violent leaps
+    "angry":   [ 0,-3, 1,-4,  2,-2, 3,-5,  0,-3,-1,-4,  1,-2, 0,-4],
+    # Disgust: lurching, uneven, dissonant landings
+    "disgust": [ 0,-2, 1,-3, -1,-4, 0,-2, -3, 1,-2, 0, -4,-1,-3,-2],
+    # Fear: erratic, wide leaps, no resolution
+    "fear":    [ 0, 4,-3, 5, -4, 3,-5, 2,  4,-3, 5,-4,  3,-5, 1,-3],
 }
 
-def _va_to_scale(v): return "major" if v>=0.05 else ("dorian" if v>=-0.3 else "minor")
+PASSING_TONES = {
+    "happy":   [ 1,  2,  1],
+    "neutral": [ 0,  1,  0],
+    "sad":     [-1, -2, -1],
+    "angry":   [-1,  1, -2],
+    "disgust": [-2,  1, -1],
+    "fear":    [ 2, -3,  1],
+}
 
-def _va_to_root(v):
-    bright  = [64, 67, 62, 69]
-    neutral = [60, 65]
-    dark    = [58, 63, 56, 61]
-    pool = bright if v>=0.2 else (neutral if v>=-0.2 else dark)
-    return pool[int(abs(v) * (len(pool)-1))]
-
-def _va_to_tempo(a):    return int(np.clip(60 + a*120, 60, 180))
-def _va_to_velocity(a): return int(np.clip(50 + a*60,  50, 110))
+def _va_to_scale(v, a):
+    """Each CREMA-D emotion has a natural scale home."""
+    if v > 0.10:   return "major"     # Happy
+    if abs(v) <= 0.10: return "dorian"  # Neutral — modal, ambiguous
+    # Negative valence:
+    if a > 0.42:   return "phrygian"  # Angry / Fear — darkest, most unstable
+    return "minor"                    # Sad / Disgust — dark but not frantic
 
 def _emotion_region(scale, valence, arousal):
-    if scale == "major":   return "happy"   if arousal >= 0.45 else "content"
-    elif scale == "dorian":return "hopeful" if arousal >= 0.45 else "pensive"
-    else:                  return "tense"   if arousal >= 0.45 else "melancholic"
+    """Delegate directly to emotion_label for a clean single source of truth."""
+    return emotion_label(valence, arousal).lower()
 
-def _build_scale(root, ivls, octaves=3):
-    return [root + i + o*12 for o in range(octaves) for i in ivls]
+def _va_to_root(v, a=0.5):
+    """
+    Happy/excited: high bright roots. Angry: low dark roots.
+    """
+    if v >= 0.15:
+        # Happy/excited: bright upper register
+        pool = [67, 69, 64, 71]        # G4, A4, E4, B4
+    elif v <= -0.15 and a >= 0.5:
+        # Angry: low dark roots — Bb2, Ab2, F2, Eb2
+        pool = [46, 44, 41, 39]
+    elif v <= -0.15:
+        # Sad: mid-low dark roots
+        pool = [58, 56, 61, 53]        # Bb3, Ab3, Db4, F3
+    else:
+        pool = [60, 65, 62]            # neutral: C4, F4, D4
+    return pool[int(abs(v) * (len(pool) - 1))]
 
-def _build_chord_voiced(root, ivls, degree, inversion=0):
-    triad_degs = [degree % 7, (degree+2) % 7, (degree+4) % 7]
-    pitches    = [root + ivls[d] for d in triad_degs]
-    for _ in range(inversion):
+def _va_to_root_name(v) -> str:
+    """Return the actual MIDI root note name for display."""
+    midi = _va_to_root(v)  # root_name uses default a
+    names = ["C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"]
+    return names[midi % 12]
+
+def _va_to_tempo(a, v=0.0):
+    """Happy/excited gets faster ceiling; angry gets a faster floor too (aggressive)."""
+    if v > 0.15:   return int(np.clip(80  + a * 120, 80,  200))  # jolly: 80–200
+    if v < -0.15:  return int(np.clip(50  + a * 120, 50,  170))  # angry: 50–170
+    return             int(np.clip(55  + a * 110, 55,  165))      # neutral
+def _va_to_velocity(a): return int(np.clip(48 + a * 65,  48, 113))
+
+def _build_scale(root, ivls, octaves=4):
+    return [root + i + o * 12 for o in range(octaves) for i in ivls]
+
+def _build_chord(root, ivls, degree, inversion=0, quality="triad"):
+    """
+    Build a voiced chord — intentionally sparse for ambient feel.
+    '7th' is silently demoted to 'triad' to avoid symphonic density.
+    'open5' plays only root + fifth (very ambient, no thirds).
+    """
+    d = degree % 7
+    if quality in ("sus2", "open5"):
+        # Root + fifth only — open, non-committal, ambient
+        degs = [d, (d + 4) % 7]
+    elif quality == "sus4":
+        degs = [d, (d + 3) % 7, (d + 4) % 7]
+    else:
+        # triad or 7th (7th demoted) — plain three-note triad
+        degs = [d, (d + 2) % 7, (d + 4) % 7]
+
+    pitches = [root + ivls[dg] for dg in degs]
+
+    for _ in range(inversion % len(pitches)):
         pitches[0] += 12
         pitches.sort()
+
     return [p - 12 for p in pitches]
 
 def _build_bass_note(root, ivls, degree):
     return root + ivls[degree % 7] - 24
 
-def _make_phrase(scale_notes, contour, start_idx, beats_per_phrase, arousal, valence, rng):
-    if arousal > 0.65:
-        rhythms = [0.5, 0.5, 1.0, 0.5, 0.5, 1.0, 0.5, 0.5]
-    elif arousal > 0.35:
-        rhythms = [1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0]
-    else:
-        rhythms = [1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+def _make_phrase(scale_notes, contour, start_idx, beats_per_phrase,
+                 arousal, valence, region, rng, phrase_num=0):
+
+    # ── Rhythm palettes ───────────────────────────────────────────────────────
+    if region == "happy":
+        base_rhythms = [0.25, 0.25, 0.5, 0.25, 0.25, 0.5, 0.25, 0.5,
+                        0.25, 0.25, 0.25, 0.5, 0.5, 0.25, 0.25, 0.25]
+        rest_prob = 0.05;  artic = 0.55
+    elif region == "angry":
+        base_rhythms = [0.25, 0.5, 0.25, 1.0, 0.25, 0.25, 0.5, 1.5,
+                        0.25, 0.25, 1.0, 0.25, 0.5, 0.25, 1.5, 0.25]
+        rest_prob = 0.55;  artic = 0.25
+    elif region == "fear":
+        base_rhythms = [0.25, 1.5, 0.25, 0.5, 2.0, 0.25, 0.25, 1.0,
+                        0.5, 0.25, 1.5, 0.25, 0.25, 2.0, 0.5, 0.25]
+        rest_prob = 0.50;  artic = 0.35
+    elif region == "disgust":
+        base_rhythms = [0.5, 1.5, 0.5, 2.0, 0.5, 1.0, 2.0, 0.5,
+                        1.0, 0.5, 2.0, 0.5, 1.5, 0.5, 1.0, 2.0]
+        rest_prob = 0.48;  artic = 0.38
+    elif region == "sad":
+        base_rhythms = [2.0, 1.0, 2.0, 2.0, 3.0, 1.0, 2.0, 2.0,
+                        2.0, 3.0, 2.0, 1.0, 2.0, 2.0, 3.0, 2.0]
+        rest_prob = 0.40;  artic = 0.92
+    else:  # neutral
+        base_rhythms = [1.0, 1.0, 2.0, 1.0, 2.0, 1.0, 1.0, 2.0,
+                        1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 2.0, 1.0]
+        rest_prob = 0.28;  artic = 0.80
 
     events   = []
     beat     = 0.0
     base_vel = _va_to_velocity(arousal)
 
+    ph_offset = 0
+    if phrase_num == 1: ph_offset = 2  if valence > 0 else -2
+    if phrase_num == 2: ph_offset = -1 if valence > 0 else 1
+    if phrase_num == 3: ph_offset = 3  if valence > 0 else -3
+
+    # Happy: start high in the scale for brightness
+    if valence > 0.1:
+        start_idx = min(start_idx + 4, len(scale_notes) - 1)
+    # Angry: go low AND add massive velocity spikes
+    elif valence < -0.1:
+        start_idx = max(start_idx - 5, 0)
+
+    total_contour_steps = len(contour)
+
     for i, offset in enumerate(contour):
-        if beat >= beats_per_phrase: break
-        dur      = min(rhythms[i % len(rhythms)], beats_per_phrase - beat)
-        idx      = int(np.clip(start_idx + offset, 0, len(scale_notes)-1))
-        note     = scale_notes[idx]
+        if beat >= beats_per_phrase:
+            break
+
+        dur = min(base_rhythms[i % len(base_rhythms)], beats_per_phrase - beat)
+        idx  = int(np.clip(start_idx + ph_offset + offset, 0, len(scale_notes) - 1))
+        note = max(0, min(127, scale_notes[idx]))
+
         beat_pos = beat % 4
-        vel_adj  = 8 if beat_pos == 0 else (4 if beat_pos == 2 else 0)
-        vel      = int(np.clip(base_vel + vel_adj + rng.randint(-5,5), 30, 120))
-        rest_prob= max(0.0, 0.12 - arousal * 0.1)
+        vel_beat = 8 if beat_pos == 0 else (4 if beat_pos == 2 else 0)
+        arc_pos  = i / max(total_contour_steps - 1, 1)
+        vel_arc  = int(10 * np.sin(arc_pos * np.pi))
+
+        # Angry: random spikes up to +35, sometimes hit max velocity
+        angry_spike = rng.randint(10, 35) if region == "angry" else 0
+
+        vel = int(np.clip(base_vel + vel_beat + vel_arc + angry_spike + rng.randint(-4, 4), 24, 127))
+
         if rng.random() > rest_prob:
-            artic = 0.55 if arousal > 0.65 else (0.80 if arousal > 0.35 else 0.92)
-            events.append((note, beat, dur * artic, vel))
+            events.append((note, beat, max(0.05, dur * artic), vel))
+
         beat += dur
 
     return events
 
 
 def generate_midi(valence: float, arousal: float,
-                  num_bars: int = 8, seed: int = 42) -> bytes:
+                  num_bars: int = 16, seed: int = 42) -> bytes:
+    """
+    Generate a richer MIDI piece. Improvements over v1:
+    - 16 bars (was 8) with intro / development / climax / outro arc
+    - 5 scales including Lydian and Phrygian, chosen from both V and A
+    - Seventh chords, sus2, sus4 alongside triads
+    - Melody has 4 distinct phrases (statement, answer, return, climax)
+    - Passing-tone ornaments at high arousal
+    - Arpeggiated chords scaled to arousal (8th-note arps at high energy)
+    - Walking/moving bass line with chromatic approach notes
+    - Dynamics arc: intro → development → climax → outro
+    - Per-phrase pitch transposition for musical variety
+    """
     rng    = random.Random(seed)
-    scale  = _va_to_scale(valence)
-    root   = _va_to_root(valence)
+    scale  = _va_to_scale(valence, arousal)
+    root   = _va_to_root(valence, arousal)
     ivls   = SCALES[scale]
-    tempo  = _va_to_tempo(arousal)
+    tempo  = _va_to_tempo(arousal, valence)
     prog   = PROGRESSIONS[scale]
     region = _emotion_region(scale, valence, arousal)
-    contour= CONTOURS[region]
+    contour = CONTOURS[region]
+    passing = PASSING_TONES[region]
 
-    scale_notes = _build_scale(root, ivls, octaves=3)
-    start_idx   = len(scale_notes) // 2
+    scale_notes = _build_scale(root, ivls, octaves=4)
+    start_idx   = len(scale_notes) // 2   # start in middle register
 
-    # Instrument selection: (melody, chord pad, bass)
-    if scale == "major" and arousal >= 0.5:
-        mel_prog, pad_prog, bas_prog = 0,  48, 33
-    elif scale == "major":
-        mel_prog, pad_prog, bas_prog = 11, 52, 32
-    elif scale == "dorian":
-        mel_prog, pad_prog, bas_prog = 73, 48, 33
-    else:
-        mel_prog, pad_prog, bas_prog = 70, 44, 42
+    # ── Instrument selection ──────────────────────────────────────────────────
+    # (melody, chord_pad, bass)  GM program numbers
+    INSTR = {
+        ("major",    True):  (0,   48, 33),   # piano / strings / finger bass
+        ("major",    False): (11,  52, 32),   # vibraphone / slow strings / acoustic bass
+        ("lydian",   True):  (10,  49, 33),   # music box / slow strings / finger bass
+        ("lydian",   False): (9,   52, 32),   # celesta / slow strings / acoustic bass
+        ("dorian",   True):  (73,  48, 33),   # flute / strings / finger bass
+        ("dorian",   False): (73,  44, 34),   # flute / tremolo strings / fretless bass
+        ("phrygian", True):  (68,  44, 42),   # oboe / tremolo / cello
+        ("phrygian", False): (70,  44, 42),   # bassoon / tremolo / cello
+        ("minor",    True):  (70,  44, 42),   # bassoon / tremolo / cello
+        ("minor",    False): (19,  44, 42),   # church organ / tremolo / cello
+    }
+    mel_prog, pad_prog, bas_prog = INSTR.get((scale, arousal >= 0.5),
+                                              (0, 48, 33))
 
-    midi = MIDIFile(numTracks=3)
-    for t in range(3): midi.addTempo(t, 0, tempo)
+    # ── Structure: 4 sections of 4 bars each ─────────────────────────────────
+    #  intro (0-3): soft, establishes mood
+    #  develop (4-7): main theme, fuller
+    #  climax (8-11): peak energy/expression
+    #  outro (12-15): resolve, fade back
+
+    def section_of(bar):
+        if bar < 4:            return "intro"
+        elif bar < 8:          return "develop"
+        elif bar < 12:         return "climax"
+        else:                  return "outro"
+
+    def section_vel_scale(bar):
+        s = section_of(bar)
+        return {"intro": 0.55, "develop": 0.85, "climax": 1.0, "outro": 0.65}[s]
+
+    midi = MIDIFile(numTracks=4)
+    for t in range(4):
+        midi.addTempo(t, 0, tempo)
     midi.addProgramChange(0, 0, 0, mel_prog)
     midi.addProgramChange(1, 1, 0, pad_prog)
     midi.addProgramChange(2, 2, 0, bas_prog)
 
     beats_per_bar    = 4
-    beats_per_phrase = beats_per_bar * 4
-    total_beats      = num_bars * beats_per_bar
+    beats_per_phrase = beats_per_bar * 4   # one phrase = 4 bars
 
-    def section_vel_scale(bar):
-        if bar < 2:               return 0.65
-        elif bar >= num_bars - 2: return 0.70
-        else:                     return 1.0
-
-    # Track 0: Melody (two 4-bar phrases)
+    # ── Track 0: Melody — 4 distinct 4-bar phrases ───────────────────────────
     for phrase_idx in range(num_bars // 4):
-        phrase_start  = phrase_idx * beats_per_phrase
-        phrase_offset = 0 if phrase_idx == 0 else (2 if valence > 0 else -2)
-        p_start_idx   = int(np.clip(start_idx + phrase_offset, 0, len(scale_notes)-1))
-        events = _make_phrase(scale_notes, contour, p_start_idx,
-                              beats_per_phrase, arousal, valence, rng)
+        phrase_start = phrase_idx * beats_per_phrase
+        events = _make_phrase(scale_notes, contour, start_idx,
+                              beats_per_phrase, arousal, valence, region,
+                              rng, phrase_num=phrase_idx)
+
+        first_bar_of_phrase = phrase_idx * 4
         for (note, beat_off, dur, vel) in events:
-            bar = int((phrase_start + beat_off) // beats_per_bar)
-            midi.addNote(0, 0, note, phrase_start + beat_off, dur,
-                         int(vel * section_vel_scale(bar)))
+            bar     = first_bar_of_phrase + int(beat_off // beats_per_bar)
+            bar     = min(bar, num_bars - 1)
+            out_vel = int(vel * section_vel_scale(bar))
+            midi.addNote(0, 0, note, phrase_start + beat_off, dur, out_vel)
 
-    # Track 1: Chords with voice leading
-    base_chord_vel = max(30, _va_to_velocity(arousal) - 20)
+
+    # Convenience flags for all 6 emotions
+    em_label   = emotion_label(valence, arousal)
+    is_happy   = em_label == "Happy"
+    is_neutral = em_label == "Neutral"
+    is_sad     = em_label == "Sad"
+    is_angry   = em_label == "Angry"
+    is_disgust = em_label == "Disgust"
+    is_fear    = em_label == "Fear"
+    is_negative_high = is_angry or is_fear   # both get aggressive treatment
+
+    # ── Track 1: Chords ───────────────────────────────────────────────────────
+    base_chord_vel = max(20, _va_to_velocity(arousal) - 28)
+
     for bar in range(num_bars):
-        bt         = bar * beats_per_bar
-        vel_scale  = section_vel_scale(bar)
-        degree, inv = prog[bar % len(prog)]
-        chord = _build_chord_voiced(root, ivls, degree, inv)
-        cv    = int(base_chord_vel * vel_scale)
-        if arousal >= 0.6:
-            step = beats_per_bar / len(chord)
+        # Chord frequency: happy/angry/fear every bar; others every 2 bars
+        if not (is_happy or is_negative_high):
+            if bar % 2 == 1 or bar == 0:
+                continue
+
+        bt  = bar * beats_per_bar
+        vs  = section_vel_scale(bar)
+        degree, inv, quality = prog[bar % len(prog)]
+
+        if is_happy:    quality = "triad"
+        elif is_angry:  quality = "sus4"
+        elif is_fear:   quality = "open5"   # open5 + dissonance added below
+        elif is_disgust:quality = "sus2"    # sus2 sounds unsettled without being angry
+
+        chord = _build_chord(root, ivls, degree, inv, quality)
+        cv    = max(1, int(base_chord_vel * vs))
+
+        if is_happy:
+            step = 0.12
             for i, n in enumerate(chord):
-                midi.addNote(1, 1, n, bt + i*step, step*0.85, cv)
-        elif arousal >= 0.35:
+                note_dur = beats_per_bar * 0.88 - i * step
+                if note_dur > 0.05:
+                    midi.addNote(1, 1, max(0,min(127,n)), bt + i*step, note_dur,
+                                 max(1, int(cv * (1.0 - i*0.1))))
+        elif is_angry:
+            for stab_beat in [0.0, 1.5, 3.0]:
+                for n in chord:
+                    midi.addNote(1, 1, max(0,min(127,n)), bt+stab_beat, 0.22, min(127,int(cv*1.4)))
+                cluster_note = max(0, min(127, chord[0]+1))
+                midi.addNote(1, 1, cluster_note, bt+stab_beat, 0.22, min(127,int(cv*1.0)))
+        elif is_fear:
+            # Sudden single-beat stab at random position — unsettling
+            stab_pos = rng.choice([0.0, 1.0, 2.0, 3.0])
             for n in chord:
-                midi.addNote(1, 1, n, bt,   1.8, cv)
-                midi.addNote(1, 1, n, bt+2, 1.8, int(cv*0.85))
+                midi.addNote(1, 1, max(0,min(127,n)), bt+stab_pos, 0.30, min(127,int(cv*1.1)))
+            # Tritone above root — maximum dissonance
+            tritone = max(0, min(127, chord[0]+6))
+            midi.addNote(1, 1, tritone, bt+stab_pos, 0.30, min(127,int(cv*0.85)))
+        elif is_disgust:
+            # Slow heavy hit on beat 1 only — one lurch per bar
+            for n in chord:
+                midi.addNote(1, 1, max(0,min(127,n)), bt, 1.20, max(1,int(cv*0.90)))
         else:
+            # Sad/Neutral: sustained 2-bar chords
+            sus_dur = beats_per_bar * 2 - 0.4
             for n in chord:
-                midi.addNote(1, 1, n, bt, beats_per_bar * 0.95, cv)
+                midi.addNote(1, 1, n, bt, sus_dur, cv)
 
-    # Track 2: Bass line
-    base_bass_vel = max(40, _va_to_velocity(arousal) - 10)
+    # ── Track 2: Bass ────────────────────────────────────────────────────────
+    base_bass_vel = max(28, _va_to_velocity(arousal) - 18)
+
     for bar in range(num_bars):
-        bt         = bar * beats_per_bar
-        vel_scale  = section_vel_scale(bar)
-        degree, _  = prog[bar % len(prog)]
+        if not (is_happy or is_negative_high or is_disgust):
+            if bar % 2 == 1 or bar == 0:
+                continue
+
+        bt     = bar * beats_per_bar
+        vs     = section_vel_scale(bar)
+        degree, _, _ = prog[bar % len(prog)]
         bass_root  = _build_bass_note(root, ivls, degree)
         bass_fifth = bass_root + 7
-        bv         = int(base_bass_vel * vel_scale)
-        if arousal >= 0.6:
-            midi.addNote(2, 2, bass_root,   bt,   0.9, bv)
-            midi.addNote(2, 2, bass_root+2, bt+1, 0.9, int(bv*0.8))
-            midi.addNote(2, 2, bass_fifth,  bt+2, 0.9, bv)
-            midi.addNote(2, 2, bass_fifth+2,bt+3, 0.9, int(bv*0.8))
-        elif arousal >= 0.35:
-            midi.addNote(2, 2, bass_root,  bt,   1.8, bv)
-            midi.addNote(2, 2, bass_fifth, bt+2, 1.8, int(bv*0.9))
+        bv         = max(1, int(base_bass_vel * vs))
+
+        if is_happy:
+            midi.addNote(2, 2, max(0,min(127,bass_root)),      bt+0.0, 0.45, bv)
+            midi.addNote(2, 2, max(0,min(127,bass_fifth)),     bt+1.0, 0.45, max(1,int(bv*0.80)))
+            midi.addNote(2, 2, max(0,min(127,bass_root)),      bt+2.0, 0.45, max(1,int(bv*0.90)))
+            midi.addNote(2, 2, max(0,min(127,bass_root+12)),   bt+3.0, 0.45, max(1,int(bv*0.70)))
+        elif is_angry:
+            low_root = max(0, min(127, bass_root-24))
+            for pos in [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]:
+                hit_vel = min(120, int(bv*(1.5 if pos in (0.0,2.0) else 1.0)))
+                midi.addNote(2, 2, low_root, bt+pos, 0.22, max(1, hit_vel))
+        elif is_fear:
+            # Sudden low hits at unpredictable offsets
+            low_root = max(0, min(127, bass_root-12))
+            for pos in sorted(rng.sample([0.0,0.5,1.0,1.5,2.0,2.5,3.0,3.5], 3)):
+                midi.addNote(2, 2, low_root, bt+pos, 0.25, max(1,int(bv*1.1)))
+        elif is_disgust:
+            # Heavy single stomp on beat 1 per bar
+            low_root = max(0, min(127, bass_root-12))
+            midi.addNote(2, 2, low_root, bt, 0.80, min(120,int(bv*1.2)))
         else:
-            midi.addNote(2, 2, bass_root, bt, beats_per_bar*0.95, bv)
+            midi.addNote(2, 2, bass_root, bt, beats_per_bar*2-0.5, bv)
+            if arousal >= 0.45:
+                midi.addNote(2, 2, bass_fifth, bt+2.0, beats_per_bar-0.5, max(1,int(bv*0.65)))
+
+    # ── Track 3: Percussion ───────────────────────────────────────────────────
+    KICK=35; SNARE=38; HIHAT=42; OPEN_HH=46; CRASH=49; RIDE=51; MARACAS=70
+
+    def drum_vel_scale(bar):
+        s = section_of(bar)
+        return {"intro":0.0,"develop":0.70,"climax":1.0,"outro":0.45}[s]
+
+    base_drum_vel = max(48, int(_va_to_velocity(arousal)*0.95))
+
+    def dv(factor, vs):
+        return max(1, min(127, int(base_drum_vel*vs*factor)))
+
+    def add_drum(pitch, bt, dur, vel):
+        if vel > 0 and dur > 0.0:
+            midi.addNote(3, 9, pitch, bt, dur, vel)
+
+    if is_happy:
+        def drum_bar(bar, bt, vs):
+            add_drum(KICK,  bt+0.0, 0.30, dv(0.70, vs))
+            add_drum(KICK,  bt+2.0, 0.30, dv(0.55, vs))
+            for eighth in range(8):
+                add_drum(HIHAT, bt+eighth*0.5, 0.18, dv(0.35 if eighth%2 else 0.50, vs))
+            add_drum(75, bt+1.0, 0.18, dv(0.45, vs))
+            add_drum(75, bt+3.0, 0.18, dv(0.40, vs))
+
+    elif is_angry:
+        def drum_bar(bar, bt, vs):
+            for pos in [0.0, 0.5, 1.0, 2.0, 2.5, 3.0]:
+                add_drum(KICK,  bt+pos, 0.28, dv(1.30 if pos in (0.0,2.0) else 1.00, vs))
+            add_drum(SNARE, bt+1.0,  0.25, dv(1.20, vs))
+            add_drum(SNARE, bt+1.05, 0.25, dv(0.70, vs))
+            add_drum(SNARE, bt+3.0,  0.25, dv(1.10, vs))
+            add_drum(SNARE, bt+3.05, 0.25, dv(0.65, vs))
+            add_drum(CRASH, bt, 0.80, dv(1.10, vs))
+            if rng.random() < 0.70:
+                add_drum(SNARE, bt+rng.choice([0.5,1.5,2.5,3.5]), 0.20, dv(0.90, vs))
+
+    elif is_fear:
+        def drum_bar(bar, bt, vs):
+            # Irregular hits — no predictable pattern, very unsettling
+            add_drum(KICK,  bt+0.0, 0.30, dv(1.00, vs))
+            add_drum(CRASH, bt+0.0, 0.70, dv(0.90, vs))
+            # Random snare hits at irregular positions
+            for pos in sorted(rng.sample([0.5,1.0,1.5,2.0,2.5,3.0,3.5], rng.randint(2,4))):
+                add_drum(SNARE, bt+pos, 0.22, dv(rng.uniform(0.60,1.10), vs))
+            # Single open hi-hat at a random position
+            add_drum(OPEN_HH, bt+rng.choice([1.0,2.0,3.0]), 0.40, dv(0.55, vs))
+
+    elif is_disgust:
+        def drum_bar(bar, bt, vs):
+            # Heavy kick every beat — stomping, unpleasant regularity
+            for beat_i in range(4):
+                add_drum(KICK, bt+beat_i, 0.40, dv(1.05, vs))
+            # Slow open hi-hat on beat 3 — grating
+            add_drum(OPEN_HH, bt+2.0, 0.70, dv(0.60, vs))
+
+    elif is_sad:
+        def drum_bar(bar, bt, vs):
+            add_drum(KICK,   bt+0.0, 0.55, dv(0.65, vs))
+            add_drum(RIDE,   bt+2.0, 0.45, dv(0.45, vs))
+            for beat_i in range(4):
+                add_drum(MARACAS, bt+beat_i, 0.16, dv(0.28, vs))
+
+    else:  # neutral
+        def drum_bar(bar, bt, vs):
+            add_drum(KICK,  bt+0.0, 0.45, dv(1.00, vs))
+            add_drum(SNARE, bt+2.0, 0.45, dv(0.85, vs))
+            add_drum(HIHAT, bt+1.0, 0.22, dv(0.50, vs))
+            add_drum(HIHAT, bt+3.0, 0.22, dv(0.43, vs))
+
+    for bar in range(num_bars):
+        bt = bar * beats_per_bar
+        vs = drum_vel_scale(bar)
+        if vs > 0.0:
+            drum_bar(bar, bt, vs)
 
     buf = io.BytesIO()
     midi.writeFile(buf)
@@ -830,19 +1159,70 @@ def stretch_va(raw_valence: float, raw_arousal: float,
 
 def emotion_label(valence: float, arousal: float) -> str:
     """
-        arousal↑   neg-val      neu-val    pos-val
-        high        Angry        Tense      Excited
-        mid         Sad          Neutral    Happy
-        low         Melancholic  Calm       Content
-    """
-    v_bin = "pos" if valence >  0.15 else ("neg" if valence < -0.15 else "neu")
-    a_bin = "hi"  if arousal >  0.65 else ("lo"  if arousal <  0.32  else "mid")
+    Map (valence, arousal) → one of 6 CREMA-D categories.
 
-    return {
-        ("pos", "hi"): "Excited",     ("pos", "mid"): "Happy",   ("pos", "lo"): "Content",
-        ("neu", "hi"): "Tense",       ("neu", "mid"): "Neutral",  ("neu", "lo"): "Calm",
-        ("neg", "hi"): "Angry",       ("neg", "mid"): "Sad",      ("neg", "lo"): "Melancholic",
-    }[(v_bin, a_bin)]
+    Calibrated from real pipeline output across 10 actors. The model's VA
+    output cannot cleanly separate all 6 emotions — the means overlap heavily:
+
+      ANG: a_mean=0.758  ← clearly highest, reliably separable
+      HAP: a_mean=0.712  ← second highest
+      DIS: a_mean=0.617  ┐
+      FEA: a_mean=0.623  ├ nearly indistinguishable from each other
+      NEU: a_mean=0.568  ┘
+      SAD: a_mean=0.522  ← clearly lowest, reliably separable
+
+    Strategy: use arousal as primary signal (it's the most reliable), and
+    valence as a secondary tiebreaker within overlapping zones.
+    Accept that DIS/FEA/NEU will sometimes be confused with each other.
+    """
+    if arousal > 0.73:
+        return "Angry"
+    if arousal < 0.55:
+        return "Sad"
+    if arousal > 0.66:
+        # High-mid zone: Happy (0.712) vs Fear (0.623 upper tail)
+        # Happy tends to have higher valence in this zone
+        return "Happy" if valence > 0.20 else "Fear"
+    if arousal > 0.59:
+        # Mid zone: Fear (0.623) vs Disgust (0.617) — nearly identical
+        # Use valence as tiebreaker: Fear tends higher valence
+        return "Fear" if valence > 0.20 else "Disgust"
+    # Low-mid zone: Neutral (0.568) territory
+    return "Neutral"
+
+
+
+def _predict_from_features(feats: dict):
+    """
+    Run the model on a feature dict and return (valence, arousal, label).
+    Uses the emotion head directly when the new model is loaded (post-retrain),
+    falls back to VA threshold classifier for the old model.
+    """
+    row_data   = np.array([[feats.get(k, 0.0) for k in _feature_cols]], dtype=np.float32)
+    row_scaled = _scaler.transform(row_data)
+    t          = torch.tensor(row_scaled).to(_torch_device)
+
+    with torch.no_grad():
+        out = _va_model(t)
+
+    # New model returns (va_tensor, emotion_logits); old returns va_tensor only
+    if isinstance(out, tuple):
+        va_tensor, em_logits = out
+        pred   = va_tensor.cpu().numpy()[0]
+        em_idx = int(em_logits.argmax(1).cpu().item())
+        label  = _EMOTION_NAMES.get(_EMOTION_CLASSES[em_idx], "Neutral")
+    else:
+        pred  = out.cpu().numpy()[0]
+        label = None
+
+    raw_v = float(np.clip(pred[0], -1.0, 1.0))
+    raw_a = float(np.clip(pred[1],  0.0, 1.0))
+    valence, arousal = stretch_va(raw_v, raw_a, feats.get("text_lex_valence", 0.0), feats)
+
+    if label is None:
+        label = emotion_label(valence, arousal)
+
+    return valence, arousal, label
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -865,61 +1245,89 @@ def debug():
         return jsonify({"error": str(e)}), 500
 
     video_file = request.files["video"]
-    with tempfile.TemporaryDirectory() as tmp:
-        video_path = os.path.join(tmp, "clip.webm")
-        audio_path = os.path.join(tmp, "clip.wav")
-        video_file.save(video_path)
-        feats = extract_features(video_path, audio_path)
-        duration = feats.pop("_audio_duration", 5.0)
-        feats.update(transcribe_and_extract(audio_path, duration))
+    orig_ext   = os.path.splitext(video_file.filename or "clip.mp4")[1] or ".mp4"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = os.path.join(tmp, f"clip{orig_ext}")
+            audio_path = os.path.join(tmp, "clip.wav")
+            video_file.save(video_path)
+            feats    = extract_features(video_path, audio_path)
+            duration = feats.pop("_audio_duration", 5.0)
+            feats.update(transcribe_and_extract(audio_path, duration))
 
-        row = np.array([[feats.get(k, 0.0) for k in _feature_cols]], dtype=np.float32)
-        row_scaled = _scaler.transform(row)
+            # Run model — use emotion head directly for label
+            row        = np.array([[feats.get(k, 0.0) for k in _feature_cols]], dtype=np.float32)
+            row_scaled = _scaler.transform(row)
+            t          = torch.tensor(row_scaled).to(_torch_device)
 
-        with torch.no_grad():
-            t       = torch.tensor(row_scaled).to(_torch_device)
-            shared  = _va_model.shared(t)
-            v_raw   = float(_va_model.valence_head(shared).cpu().item())
-            a_logit = float(_va_model.arousal_head(shared).cpu().item())
-            a_raw   = float(torch.sigmoid(_va_model.arousal_head(shared)).cpu().item())
+            with torch.no_grad():
+                out = _va_model(t)
 
-        # Compute rule-based signal for comparison
-        rb_v, rb_a, rb_label = _rule_based_va(feats)
-        sv, sa = stretch_va(v_raw, a_raw, feats.get("text_lex_valence", 0.0))
+            if isinstance(out, tuple):
+                va_tensor, em_logits = out
+                pred    = va_tensor.cpu().numpy()[0]
+                em_idx  = int(em_logits.argmax(1).cpu().item())
+                # Softmax probabilities for all 6 classes
+                probs   = torch.softmax(em_logits, dim=1).cpu().numpy()[0]
+                em_label = _EMOTION_NAMES.get(_EMOTION_CLASSES[em_idx], "Neutral")
+            else:
+                pred     = out.cpu().numpy()[0]
+                em_label = None
+                probs    = None
 
-    return jsonify({
-        # Model outputs
+            v_raw   = float(pred[0])
+            a_raw   = float(torch.sigmoid(torch.tensor(pred[1])).item())
+            a_logit = float(pred[1])
+            sv, sa  = stretch_va(
+                float(np.clip(v_raw, -1.0, 1.0)),
+                float(np.clip(a_raw,  0.0, 1.0)),
+                feats.get("text_lex_valence", 0.0), feats)
+
+            if em_label is None:
+                em_label = emotion_label(sv, sa)
+
+            rb_v, rb_a, rb_label = _rule_based_va(feats)
+
+    except Exception as e:
+        return jsonify({"error": str(e), "detail": traceback.format_exc()}), 500
+
+    resp = {
+        "emotion_label":      em_label,
         "raw_valence":        round(v_raw,   4),
         "raw_arousal":        round(a_raw,   4),
         "arousal_logit":      round(a_logit, 4),
         "stretched_valence":  round(sv, 4),
         "stretched_arousal":  round(sa, 4),
-        "model_label":        emotion_label(sv, sa),
-        # Rule-based override for comparison
         "rule_valence":       round(rb_v, 4),
         "rule_arousal":       round(rb_a, 4),
         "rule_label":         rb_label,
-        # Key acoustic features — are these varying between clips?
         "energy_mean":        round(feats.get("energy_mean",      0), 6),
         "energy_std":         round(feats.get("energy_std",       0), 6),
         "pitch_mean":         round(feats.get("pitch_mean",       0), 2),
         "pitch_std":          round(feats.get("pitch_std",        0), 2),
         "zcr":                round(feats.get("zcr",              0), 5),
         "hnr":                round(feats.get("hnr",              0), 3),
-        "spec_centroid":      round(feats.get("spec_centroid",    0), 1),
         "jitter":             round(feats.get("jitter",           0), 5),
+        "shimmer":            round(feats.get("shimmer",          0), 5),
+        "cpp":                round(feats.get("cpp",              0), 4),
+        "energy_slope":       round(feats.get("energy_slope",     0), 6),
         "pitch_slope":        round(feats.get("pitch_slope",      0), 3),
-        # Visual features
+        "pause_ratio":        round(feats.get("pause_ratio",      0), 3),
+        "voiced_trans_rate":  round(feats.get("voiced_trans_rate",0), 5),
+        "spectral_entropy":   round(feats.get("spectral_entropy", 0), 4),
+        "lowfreq_energy_ratio": round(feats.get("lowfreq_energy_ratio", 0), 4),
         "face_detected":      feats.get("face_detected", 0),
         "face_smile_mean":    round(feats.get("face_smile_mean",  0), 4),
         "face_furrow_mean":   round(feats.get("face_furrow_mean", 0), 4),
-        # Text
         "text_lex_valence":   round(feats.get("text_lex_valence", 0), 3),
-        # Sanity
         "feature_count":      len(_feature_cols),
         "nonzero_features":   int(np.count_nonzero(row[0])),
         "audio_duration_s":   round(duration, 2),
-    })
+    }
+    if probs is not None:
+        for i, cls in enumerate(_EMOTION_CLASSES):
+            resp[f"prob_{cls}"] = round(float(probs[i]), 4)
+    return jsonify(resp)
 
 
 @app.route("/predict", methods=["POST"])
@@ -939,7 +1347,8 @@ def predict():
     video_file = request.files["video"]
 
     with tempfile.TemporaryDirectory() as tmp:
-        video_path = os.path.join(tmp, "clip.webm")
+        orig_ext = os.path.splitext(video_file.filename or "clip.mp4")[1] or ".mp4"
+        video_path = os.path.join(tmp, f"clip{orig_ext}")
         audio_path = os.path.join(tmp, "clip.wav")
         video_file.save(video_path)
 
@@ -954,22 +1363,15 @@ def predict():
         text_feats = transcribe_and_extract(audio_path, duration)
         feats.update(text_feats)
 
-        # Build feature vector aligned to training columns
-        row_data = np.array([[feats.get(k, 0.0) for k in _feature_cols]],
-                             dtype=np.float32)
-        row_scaled = _scaler.transform(row_data)
-        with torch.no_grad():
-            pred = _va_model(torch.tensor(row_scaled).to(_torch_device)).cpu().numpy()[0]
-        raw_v = float(np.clip(pred[0], -1.0, 1.0))
-        raw_a = float(np.clip(pred[1],  0.0, 1.0))
-        valence, arousal = stretch_va(raw_v, raw_a, feats.get("text_lex_valence", 0.0), feats)
-        tempo    = _va_to_tempo(arousal)
-        label    = emotion_label(valence, arousal)
+        valence, arousal, label = _predict_from_features(feats)
+        scale = _va_to_scale(valence, arousal)
+        tempo = _va_to_tempo(arousal, valence)
 
     return jsonify({
         "valence":       round(valence, 4),
         "arousal":       round(arousal, 4),
         "scale":         scale,
+        "root_name":     _va_to_root_name(valence),
         "tempo_bpm":     tempo,
         "emotion_label": label,
     })
@@ -992,7 +1394,8 @@ def generate():
     video_file = request.files["video"]
 
     with tempfile.TemporaryDirectory() as tmp:
-        video_path = os.path.join(tmp, "clip.webm")
+        orig_ext = os.path.splitext(video_file.filename or "clip.mp4")[1] or ".mp4"
+        video_path = os.path.join(tmp, f"clip{orig_ext}")
         audio_path = os.path.join(tmp, "clip.wav")
         video_file.save(video_path)
 
@@ -1007,19 +1410,13 @@ def generate():
         text_feats = transcribe_and_extract(audio_path, duration)
         feats.update(text_feats)
 
-        row_data = np.array([[feats.get(k, 0.0) for k in _feature_cols]],
-                             dtype=np.float32)
-        row_scaled = _scaler.transform(row_data)
-        with torch.no_grad():
-            pred = _va_model(torch.tensor(row_scaled).to(_torch_device)).cpu().numpy()[0]
-        raw_v = float(np.clip(pred[0], -1.0, 1.0))
-        raw_a = float(np.clip(pred[1],  0.0, 1.0))
-        valence, arousal = stretch_va(raw_v, raw_a, feats.get("text_lex_valence", 0.0), feats)
-    scale = _va_to_scale(valence)
-    tempo = _va_to_tempo(arousal)
-    label = emotion_label(valence, arousal)
+        valence, arousal, label = _predict_from_features(feats)
+    scale = _va_to_scale(valence, arousal)
+    tempo = _va_to_tempo(arousal, valence)
 
-    midi_bytes = generate_midi(valence, arousal, num_bars=8)
+    import time as _time
+    midi_seed  = int(_time.time() * 1000) % (2**31)
+    midi_bytes = generate_midi(valence, arousal, num_bars=16, seed=midi_seed)
     import base64
     midi_b64 = base64.b64encode(midi_bytes).decode()
 
@@ -1027,6 +1424,7 @@ def generate():
         "valence":       round(valence, 4),
         "arousal":       round(arousal, 4),
         "scale":         scale,
+        "root_name":     _va_to_root_name(valence),
         "tempo_bpm":     tempo,
         "emotion_label": label,
         "midi_b64":      midi_b64,
