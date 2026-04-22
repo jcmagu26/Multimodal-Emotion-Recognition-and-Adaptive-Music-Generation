@@ -6,6 +6,7 @@
 <title>Resonance — Emotion-Driven Music</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300&family=DM+Mono:wght@300;400&display=swap');
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
   --bg: #080a0f; --surface: #0e1118; --card: #131720; --border: #1e2535;
@@ -13,8 +14,17 @@
   --text: #e8e4dc; --muted: #6b7280; --radius: 12px;
   --font-head: 'Cormorant Garamond', Georgia, serif;
   --font-body: 'DM Mono', 'Courier New', monospace;
+  /* Emotion theme vars — overridden by JS */
+  --emotion-accent:  #c8a96e;
+  --emotion-glow:    rgba(200,169,110,0.10);
+  --emotion-border:  #1e2535;
 }
-@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300&family=DM+Mono:wght@300;400&display=swap');
+/* Smooth transitions on all theme-reactive properties */
+body, .card, .emotion-pill.active, .stat-bar-fill, .play-btn,
+.dot.active, .progress-fill, .waveform-container {
+  transition: background-color 0.8s ease, border-color 0.8s ease,
+              box-shadow 0.8s ease, color 0.8s ease;
+}
 html, body { height: 100%; background: var(--bg); color: var(--text);
   font-family: var(--font-body); font-size: 13px; letter-spacing: 0.02em; overflow-x: hidden; }
 body::before { content: ''; position: fixed; inset: 0;
@@ -38,8 +48,7 @@ main { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 32px 0
 .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
 .dot.active { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
 .dot.recording { background: var(--danger); box-shadow: 0 0 8px var(--danger); animation: pulse 1s ease-in-out infinite; }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-.camera-body { padding: 20px; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }.camera-body { padding: 20px; }
 #video-preview { width: 100%; aspect-ratio: 4/3; background: #050709; border-radius: 8px;
   border: 1px solid var(--border); display: block; object-fit: cover; }
 .camera-controls { display: flex; gap: 10px; margin-top: 16px; }
@@ -74,14 +83,14 @@ main { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 32px 0
 .emotion-pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px;
   border-radius: 100px; border: 1px solid var(--border); font-size: 12px;
   letter-spacing: 0.1em; color: var(--muted); transition: all 0.4s; width: fit-content; }
-.emotion-pill.active { border-color: var(--accent); color: var(--accent); background: rgba(200,169,110,0.08); }
+.emotion-pill.active { border-color: var(--accent); color: var(--accent); background: var(--emotion-glow); }
 .music-params { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .param-cell { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
 .param-key { font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
 .param-val { font-size: 18px; font-family: var(--font-head); font-weight: 300; color: var(--text); line-height: 1; }
 .player-panel { grid-column: 1 / -1; }
 .player-body { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
-.waveform-container { width: 100%; height: 64px; background: var(--surface); border-radius: 8px;
+.waveform-container { width: 100%; height: 110px; background: var(--surface); border-radius: 8px;
   border: 1px solid var(--border); overflow: hidden; }
 #waveform-canvas { width: 100%; height: 100%; display: block; }
 .player-controls { display: flex; align-items: center; gap: 16px; }
@@ -94,6 +103,24 @@ main { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 32px 0
 .player-meta { flex: 1; display: flex; flex-direction: column; gap: 4px; }
 .player-label { font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); }
 .player-track { font-family: var(--font-head); font-size: 1.4rem; font-weight: 300; font-style: italic; color: var(--text); }
+.loop-btn { width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--border);
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 16px;
+  display: flex; align-items: center; justify-content: center; transition: all 0.2s; flex-shrink: 0; }
+.loop-btn:hover:not(:disabled) { border-color: var(--accent2); color: var(--accent2); }
+.loop-btn.active { border-color: var(--accent2); color: var(--accent2);
+  background: rgba(110,158,200,0.12); box-shadow: 0 0 6px var(--accent2); }
+.loop-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+.dl-btn { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: transparent; color: var(--muted); cursor: pointer; font-family: var(--font-body);
+  font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+  transition: all 0.2s; flex-shrink: 0; white-space: nowrap; }
+.dl-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.dl-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+.history-strip { display: flex; gap: 6px; flex-wrap: wrap; min-height: 24px; }
+.history-chip { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 100px; border: 1px solid var(--border);
+  color: var(--muted); opacity: 0.6; transition: opacity 0.3s; }
+.history-chip:first-child { opacity: 1; border-color: var(--accent); color: var(--accent); }
 .progress-track { height: 2px; background: var(--border); border-radius: 1px; margin-top: 4px; overflow: hidden; }
 .progress-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.2s linear; border-radius: 1px; }
 .status-log { grid-column: 1 / -1; background: var(--surface); border: 1px solid var(--border);
@@ -196,13 +223,22 @@ footer { padding: 20px 0; border-top: 1px solid var(--border);
             <span class="compass-label left">−V</span>
             <span class="compass-label right">+V</span>
             <svg class="compass-svg" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
+              <!-- Emotion region labels -->
+              <text x="32" y="28"  font-size="7" fill="#2a3545" text-anchor="middle" font-family="monospace">ANGRY</text>
+              <text x="108" y="28" font-size="7" fill="#2a3545" text-anchor="middle" font-family="monospace">FEAR</text>
+              <text x="108" y="78" font-size="7" fill="#2a3545" text-anchor="middle" font-family="monospace">HAPPY</text>
+              <text x="70"  y="95" font-size="7" fill="#2a3545" text-anchor="middle" font-family="monospace">NEUTRAL</text>
+              <text x="32"  y="78" font-size="7" fill="#2a3545" text-anchor="middle" font-family="monospace">DISGUST</text>
+              <text x="70"  y="128" font-size="7" fill="#2a3545" text-anchor="middle" font-family="monospace">SAD</text>
+              <!-- Grid -->
               <line x1="70" y1="10" x2="70" y2="130" stroke="#1e2535" stroke-width="1"/>
               <line x1="10" y1="70" x2="130" y2="70" stroke="#1e2535" stroke-width="1"/>
               <circle cx="70" cy="70" r="55" fill="none" stroke="#1e2535" stroke-width="1"/>
               <circle cx="70" cy="70" r="28" fill="none" stroke="#1e2535" stroke-width="0.5" stroke-dasharray="2 4"/>
-              <circle id="va-point" cx="70" cy="70" r="6" fill="none" stroke="#c8a96e" stroke-width="2"
+              <!-- Current position -->
+              <circle id="va-point" cx="70" cy="70" r="6" fill="none" stroke="var(--accent)" stroke-width="2"
                 style="transition: cx 0.6s cubic-bezier(0.34,1.56,0.64,1), cy 0.6s cubic-bezier(0.34,1.56,0.64,1)"/>
-              <circle id="va-dot"   cx="70" cy="70" r="3" fill="#c8a96e"
+              <circle id="va-dot"   cx="70" cy="70" r="3" fill="var(--accent)"
                 style="transition: cx 0.6s cubic-bezier(0.34,1.56,0.64,1), cy 0.6s cubic-bezier(0.34,1.56,0.64,1)"/>
             </svg>
           </div>
@@ -220,11 +256,13 @@ footer { padding: 20px 0; border-top: 1px solid var(--border);
           </div>
         </div>
         <div class="emotion-pill" id="emotion-pill"><span>○</span><span id="emotion-text">Awaiting clip…</span></div>
+        <!-- Detection history strip -->
+        <div class="history-strip" id="history-strip"></div>
         <div class="music-params">
-          <div class="param-cell"><div class="param-key">Key</div>   <div class="param-val" id="param-key">—</div></div>
-          <div class="param-cell"><div class="param-key">Tempo</div> <div class="param-val" id="param-tempo">—</div></div>
-          <div class="param-cell"><div class="param-key">Mode</div>  <div class="param-val" id="param-mode">—</div></div>
-          <div class="param-cell"><div class="param-key">Instrument</div><div class="param-val" id="param-instr">—</div></div>
+          <div class="param-cell"><div class="param-key">Key</div>    <div class="param-val" id="param-key">—</div></div>
+          <div class="param-cell"><div class="param-key">Tempo</div>  <div class="param-val" id="param-tempo">—</div></div>
+          <div class="param-cell"><div class="param-key">Scale</div>  <div class="param-val" id="param-mode">—</div></div>
+          <div class="param-cell"><div class="param-key">Sound</div>  <div class="param-val" id="param-instr">—</div></div>
         </div>
       </div>
     </div>
@@ -243,11 +281,13 @@ footer { padding: 20px 0; border-top: 1px solid var(--border);
         <div class="waveform-container"><canvas id="waveform-canvas"></canvas></div>
         <div class="player-controls">
           <button class="play-btn" id="btn-play" disabled>▶</button>
+          <button class="loop-btn" id="btn-loop" disabled title="Toggle loop">↺</button>
           <div class="player-meta">
             <div class="player-label">Now Playing</div>
             <div class="player-track" id="track-title">—</div>
             <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
           </div>
+          <button class="dl-btn" id="btn-download" disabled title="Download MIDI">↓ MIDI</button>
         </div>
       </div>
     </div>
@@ -269,6 +309,8 @@ const btnStartCam  = document.getElementById("btn-start-cam");
 const btnRecord    = document.getElementById("btn-record");
 const btnAnalyze   = document.getElementById("btn-analyze");
 const btnPlay      = document.getElementById("btn-play");
+const btnLoop      = document.getElementById("btn-loop");
+const btnDownload  = document.getElementById("btn-download");
 const camDot       = document.getElementById("cam-dot");
 const emotionDot   = document.getElementById("emotion-dot");
 const playerDot    = document.getElementById("player-dot");
@@ -300,9 +342,11 @@ const btnAnalyzeUp   = document.getElementById("btn-analyze-upload");
 // ── State ─────────────────────────────────────────────────────────────────────
 let stream = null, mediaRecorder = null, recordedChunks = [], recordedBlob = null;
 let uploadedBlob = null;
+let currentMidiBlob = null;   // kept for download button
 let scheduledNotes = [], toneBpm = 120;
 let synth = null, chordSynth = null, bassSynth = null;
-let isPlaying = false, playStartTime = 0, playDuration = 0, rafId = null;
+let _effectNodes = [];         // all disposable Tone nodes from the last play()
+let isPlaying = false, isLooping = false, playStartTime = 0, playDuration = 0, rafId = null;
 let toneAnalyser = null;
 
 // ── Status helpers ────────────────────────────────────────────────────────────
@@ -386,9 +430,9 @@ btnAnalyze.addEventListener("click", async () => {
     }
 
     const data = await res.json();
-    const { valence, arousal, scale, tempo_bpm, emotion_label, midi_b64 } = data;
+    const { valence, arousal, scale, root_name, tempo_bpm, emotion_label, midi_b64 } = data;
 
-    updateEmotionUI(valence, arousal, scale, tempo_bpm, emotion_label);
+    updateEmotionUI(valence, arousal, scale, tempo_bpm, emotion_label, root_name);
 
     // Decode base64 MIDI
     const binary = atob(midi_b64);
@@ -406,8 +450,57 @@ btnAnalyze.addEventListener("click", async () => {
   }
 });
 
+// ── Emotion theme ─────────────────────────────────────────────────────────────
+// Maps emotion label → colour palette applied to CSS variables
+const EMOTION_THEMES = {
+  Happy:   { accent: "#f5c842", accent2: "#f5a800", glow: "rgba(245,168,0,0.12)",   border: "#3a2e0a", bg: "#0c0a05" },
+  Neutral: { accent: "#c8a96e", accent2: "#6e9ec8", glow: "rgba(200,169,110,0.08)", border: "#1e2535", bg: "#080a0f" },
+  Sad:     { accent: "#7090c8", accent2: "#3060a8", glow: "rgba(48,96,168,0.10)",   border: "#0a1530", bg: "#04070e" },
+  Angry:   { accent: "#e05050", accent2: "#c02020", glow: "rgba(192,32,32,0.14)",   border: "#3a0808", bg: "#0d0404" },
+  Disgust: { accent: "#7a9a50", accent2: "#4a7a20", glow: "rgba(74,122,32,0.11)",   border: "#182808", bg: "#060a03" },
+  Fear:    { accent: "#9060c8", accent2: "#6030a8", glow: "rgba(96,48,168,0.12)",   border: "#1e0a38", bg: "#07040e" },
+};
+
+function applyEmotionTheme(label) {
+  const theme = EMOTION_THEMES[label] || EMOTION_THEMES.Neutral;
+  const root  = document.documentElement.style;
+  root.setProperty("--accent",          theme.accent);
+  root.setProperty("--accent2",         theme.accent2);
+  root.setProperty("--emotion-glow",    theme.glow);
+  root.setProperty("--emotion-border",  theme.border);
+  root.setProperty("--bg",              theme.bg);
+  // Stat bars
+  document.querySelector(".stat-bar-fill:not(.arousal)").style.background = theme.accent;
+  document.querySelector(".stat-bar-fill.arousal").style.background        = theme.accent2;
+  // Player controls
+  document.querySelector(".play-btn").style.borderColor  = theme.accent;
+  document.querySelector(".play-btn").style.color        = theme.accent;
+  document.querySelector(".progress-fill").style.background = theme.accent;
+  // VA compass dot
+  const vaPoint = document.getElementById("va-point");
+  const vaDot   = document.getElementById("va-dot");
+  if (vaPoint) vaPoint.style.stroke = theme.accent;
+  if (vaDot)   vaDot.style.fill     = theme.accent;
+}
+
+// ── Detection history ─────────────────────────────────────────────────────────
+const detectionHistory = [];
+const MAX_HISTORY = 6;
+
+function updateHistory(label) {
+  detectionHistory.unshift(label);
+  if (detectionHistory.length > MAX_HISTORY) detectionHistory.pop();
+  const strip = document.getElementById("history-strip");
+  strip.innerHTML = detectionHistory.map((l, i) =>
+    `<span class="history-chip" style="order:${i}">${l}</span>`
+  ).join("");
+}
+
 // ── Emotion UI ────────────────────────────────────────────────────────────────
-function updateEmotionUI(valence, arousal, scale, tempo, label) {
+function updateEmotionUI(valence, arousal, scale, tempo, label, rootName) {
+  // Store for synth configuration
+  currentEmotion = { valence, arousal, scale, label };
+
   emotionDot.className  = "dot active";
   emotionPill.className = "emotion-pill active";
   emotionText.textContent = label;
@@ -419,13 +512,15 @@ function updateEmotionUI(valence, arousal, scale, tempo, label) {
   const cy = 125 - arousal * 110;
   vaPoint.setAttribute("cx", cx); vaPoint.setAttribute("cy", cy);
   vaDot.setAttribute("cx", cx);   vaDot.setAttribute("cy", cy);
-  const scaleLabels  = { major: "Major", dorian: "Dorian", minor: "Minor" };
-  const rootNames    = { major: "G", dorian: "D", minor: "F" };
-  const instruments  = { major: arousal >= 0.5 ? "Piano" : "Vibraphone", dorian: "Flute", minor: "Bassoon" };
-  paramKey.textContent   = rootNames[scale]    || "C";
+  const scaleLabels = { major: "Major", dorian: "Dorian", minor: "Minor", phrygian: "Phrygian" };
+  const instruments = { Happy: "Chimes", Neutral: "Bells", Sad: "Strings",
+                        Angry: "Distortion", Fear: "Organ", Disgust: "Bass Clarinet" };
+  paramKey.textContent   = (rootName || "C") + " " + (scaleLabels[scale] || scale);
   paramTempo.textContent = tempo + " BPM";
-  paramMode.textContent  = scaleLabels[scale]  || scale;
-  paramInstr.textContent = instruments[scale]  || "Piano";
+  paramMode.textContent  = scaleLabels[scale] || scale;
+  paramInstr.textContent = instruments[label] || "Piano";
+  applyEmotionTheme(label);
+  updateHistory(label);
 }
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
@@ -484,8 +579,8 @@ btnAnalyzeUp.addEventListener("click", async () => {
       throw new Error(err.error || res.statusText);
     }
     const data = await res.json();
-    const { valence, arousal, scale, tempo_bpm, emotion_label, midi_b64 } = data;
-    updateEmotionUI(valence, arousal, scale, tempo_bpm, emotion_label);
+    const { valence, arousal, scale, root_name, tempo_bpm, emotion_label, midi_b64 } = data;
+    updateEmotionUI(valence, arousal, scale, tempo_bpm, emotion_label, root_name);
 
     const binary = atob(midi_b64);
     const bytes  = new Uint8Array(binary.length);
@@ -501,7 +596,7 @@ btnAnalyzeUp.addEventListener("click", async () => {
   }
 });
 
-// ── MIDI parser ───────────────────────────────────────────────────────────────
+// ── MIDI parser — tracks note-on/off for correct durations ───────────────────
 function parseMidi(bytes) {
   let pos = 0;
   function readUint32() { const b=bytes.slice(pos,pos+4);pos+=4;return(b[0]<<24)|(b[1]<<16)|(b[2]<<8)|b[3]; }
@@ -513,16 +608,37 @@ function parseMidi(bytes) {
   for(let t=0;t<numTracks;t++){
     pos+=4; const trackLen=readUint32(); const trackEnd=pos+trackLen;
     let tick=0,lastStatus=0;
+    // noteOn[channel][note] = {startTick, velocity}
+    const noteOn = Array.from({length:16}, () => ({}));
     while(pos<trackEnd){
       const delta=readVarLen(); tick+=delta;
       let sb=bytes[pos];
       if(sb&0x80){lastStatus=sb;pos++;}else{sb=lastStatus;}
-      const type=sb>>4, channel=sb&0x0f;
+      const type=sb>>4, ch=sb&0x0f;
       if(type===0x09){
         const note=bytes[pos++],vel=bytes[pos++];
-        if(vel>0) notes.push({time:tick/division*4,duration:2,note,velocity:vel,channel});
-      } else if(type===0x08){pos+=2;}
-        else if(type===0x0a){pos+=2;}
+        if(vel>0){
+          noteOn[ch][note]={startTick:tick, velocity:vel};
+        } else {
+          // note-on with vel=0 counts as note-off
+          if(noteOn[ch][note]){
+            const dur = (tick - noteOn[ch][note].startTick) / division * 4;
+            notes.push({time: noteOn[ch][note].startTick/division*4,
+                        duration: Math.max(dur, 0.05),
+                        note, velocity: noteOn[ch][note].velocity, channel: ch});
+            delete noteOn[ch][note];
+          }
+        }
+      } else if(type===0x08){
+        const note=bytes[pos++]; pos++; // skip vel
+        if(noteOn[ch][note]){
+          const dur = (tick - noteOn[ch][note].startTick) / division * 4;
+          notes.push({time: noteOn[ch][note].startTick/division*4,
+                      duration: Math.max(dur, 0.05),
+                      note, velocity: noteOn[ch][note].velocity, channel: ch});
+          delete noteOn[ch][note];
+        }
+      } else if(type===0x0a){pos+=2;}
         else if(type===0x0b){pos+=2;}
         else if(type===0x0c){pos+=1;}
         else if(type===0x0d){pos+=1;}
@@ -546,14 +662,40 @@ async function loadMidi(midiBlob, label, scale, tempo) {
   const buf  = await midiBlob.arrayBuffer();
   const notes = parseMidi(new Uint8Array(buf));
   scheduledNotes         = notes;
+  currentMidiBlob        = midiBlob;
   toneBpm                = parseInt(tempo) || 120;
   trackTitle.textContent = label + " — " + scale + " " + toneBpm + " BPM";
   playerDot.className    = "dot active";
   btnPlay.disabled       = false;
+  btnLoop.disabled       = false;
+  btnDownload.disabled   = false;
   btnPlay.textContent    = "▶";
   isPlaying              = false;
   progressFill.style.width = "0%";
 }
+
+// ── Emotion state for synth configuration ────────────────────────────────────
+let currentEmotion = { valence: 0, arousal: 0.5, scale: "major", label: "Neutral" };
+
+// ── Loop toggle ───────────────────────────────────────────────────────────────
+btnLoop.addEventListener("click", () => {
+  isLooping = !isLooping;
+  btnLoop.classList.toggle("active", isLooping);
+  Tone.Transport.loop       = isLooping;
+  Tone.Transport.loopStart  = 0;
+  Tone.Transport.loopEnd    = isLooping ? (playDuration + "s") : undefined;
+});
+
+// ── MIDI download ─────────────────────────────────────────────────────────────
+btnDownload.addEventListener("click", () => {
+  if (!currentMidiBlob) return;
+  const label = (trackTitle.textContent || "resonance").replace(/[^a-z0-9]/gi, "_").toLowerCase();
+  const url = URL.createObjectURL(currentMidiBlob);
+  const a   = document.createElement("a");
+  a.href = url; a.download = label + ".mid";
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+});
 
 // ── Playback ──────────────────────────────────────────────────────────────────
 btnPlay.addEventListener("click", async () => {
@@ -563,6 +705,7 @@ btnPlay.addEventListener("click", async () => {
     Tone.Transport.stop(); Tone.Transport.cancel();
     isPlaying = false; btnPlay.textContent = "▶";
     progressFill.style.width = "0%"; cancelAnimationFrame(rafId);
+    stopVisualizer();
     return;
   }
 
@@ -570,84 +713,366 @@ btnPlay.addEventListener("click", async () => {
   Tone.Transport.bpm.value = toneBpm;
   Tone.Transport.cancel();
 
-  if (synth)      synth.dispose();
-  if (chordSynth) chordSynth.dispose();
-  if (bassSynth)  bassSynth.dispose();
+  // Dispose ALL previous Tone nodes to prevent AudioContext leak
+  if (synth)      { try { synth.dispose();      } catch(e){} }
+  if (chordSynth) { try { chordSynth.dispose();  } catch(e){} }
+  if (bassSynth)  { try { bassSynth.dispose();   } catch(e){} }
+  _effectNodes.forEach(n => { try { n.dispose(); } catch(e){} });
+  _effectNodes = [];
+
+  const v  = currentEmotion.valence;
+  const a  = currentEmotion.arousal;
+  const sc = currentEmotion.scale;
+
+  // ── Melody synth — timbre per CREMA-D emotion ─────────────────────────────
+  // Must declare em before effects chain so we can use it there
+  const em = currentEmotion.label || "Neutral";
+  const negHigh = em === "Angry" || em === "Fear";
+
+  // ── Effects chain ─────────────────────────────────────────────────────────
+  const reverbDecay = (em === "Sad")    ? 5.5 :
+                      (em === "Fear")   ? 4.0 :
+                      negHigh          ? 1.5 :
+                      (em === "Happy") ? 1.8 : 3.5;
+
+  const reverb = new Tone.Reverb({ decay: reverbDecay, wet: 0.35 });
+  await reverb.generate();
+
+  const chorus = new Tone.Chorus({
+    frequency: negHigh ? 0.5 : 1.2,
+    delayTime: 4.0,
+    depth:     0.20,
+    wet:       em === "Happy" ? 0.22 : 0.14,
+  }).start();
+
+  const limiter = new Tone.Limiter(-4);
+
+  const eq = new Tone.EQ3({
+    low:  (em === "Angry" || em === "Disgust") ?  3 : (em === "Sad" ? 2 : 0),
+    mid:  0,
+    high: (em === "Happy") ? 1.5 : (negHigh ? -3 : 0),
+  });
+
+  const masterChain = reverb.chain(chorus, eq, limiter, Tone.Destination);
+  _effectNodes.push(reverb, chorus, eq, limiter);
+  let melOscType, melEnv, melVol;
+  if (em === "Happy") {
+    melOscType = "triangle";
+    melEnv     = { attack: 0.01, decay: 0.12, sustain: 0.30, release: 0.4 };
+    melVol     = -10;
+  } else if (em === "Angry") {
+    melOscType = "triangle4";
+    melEnv     = { attack: 0.005, decay: 0.08, sustain: 0.30, release: 0.15 };
+    melVol     = -8;
+  } else if (em === "Fear") {
+    melOscType = "triangle4";
+    melEnv     = { attack: 0.01, decay: 0.18, sustain: 0.35, release: 0.20 };
+    melVol     = -10;
+  } else if (em === "Disgust") {
+    melOscType = "triangle4";
+    melEnv     = { attack: 0.04, decay: 0.30, sustain: 0.50, release: 0.50 };
+    melVol     = -12;
+  } else if (em === "Sad") {
+    melOscType = "sine";
+    melEnv     = { attack: 0.18, decay: 0.35, sustain: 0.60, release: 3.0 };
+    melVol     = -13;
+  } else {  // Neutral
+    melOscType = "triangle";
+    melEnv     = { attack: 0.08, decay: 0.20, sustain: 0.60, release: 1.5 };
+    melVol     = -13;
+  }
 
   synth = new Tone.PolySynth(Tone.Synth, {
-    oscillator: { type: "triangle" },
-    envelope:   { attack: 0.04, decay: 0.15, sustain: 0.65, release: 1.2 },
-    volume: -6,
-  }).toDestination();
+    oscillator: { type: melOscType },
+    envelope:   melEnv,
+    volume:     melVol,
+  }).connect(masterChain);
 
+  // Chord pad — angry/fear: harsh stab; happy: quick bright; others: slow bloom
   chordSynth = new Tone.PolySynth(Tone.Synth, {
-    oscillator: { type: "sine" },
-    envelope:   { attack: 0.08, decay: 0.3, sustain: 0.75, release: 2.0 },
-    volume: -14,
-  }).toDestination();
+    oscillator: { type: negHigh ? "triangle4" : "sine" },
+    envelope:   negHigh
+      ? { attack: 0.01, decay: 0.18, sustain: 0.10, release: 0.25 }
+      : em === "Happy"
+        ? { attack: 0.02, decay: 0.15, sustain: 0.40, release: 0.8 }
+        : { attack: em === "Disgust" ? 0.15 : 0.50, decay: 0.60, sustain: 0.55, release: em === "Sad" ? 5.0 : 3.0 },
+    volume: negHigh ? -14 : em === "Happy" ? -16 : -22,
+  }).connect(masterChain);
 
+  // Bass synth
   bassSynth = new Tone.Synth({
-    oscillator: { type: "triangle" },
-    envelope:   { attack: 0.02, decay: 0.1, sustain: 0.8, release: 0.5 },
-    volume: -10,
-  }).toDestination();
+    oscillator: { type: negHigh ? "triangle4" : "triangle" },
+    envelope:   negHigh
+      ? { attack: 0.01, decay: 0.25, sustain: 0.40, release: 0.30 }
+      : em === "Sad"
+        ? { attack: 0.10, decay: 0.30, sustain: 0.70, release: 2.00 }
+        : { attack: 0.04, decay: 0.20, sustain: 0.70, release: 1.00 },
+    volume: negHigh ? -10 : -15,
+  }).connect(masterChain);
 
+  // Heavy distortion + Chebyshev waveshaper for Angry and Fear
+  if (negHigh) {
+    const dist  = new Tone.Distortion({ distortion: em === "Angry" ? 0.85 : 0.50, wet: 0.70 });
+    const cheby = new Tone.Chebyshev(em === "Angry" ? 5 : 3);
+    synth.disconnect();
+    synth.chain(dist, cheby, masterChain);
+    _effectNodes.push(dist, cheby);
+  }
+
+  // ── Percussion synths ─────────────────────────────────────────────────────
+  const kickSynth = new Tone.MembraneSynth({
+    pitchDecay: em === "Angry" ? 0.02 : em === "Fear" ? 0.03 : 0.08,
+    octaves:    negHigh ? 8 : 4,
+    envelope:   { attack: 0.001, decay: 0.28, sustain: 0, release: 0.25 },
+    volume:     em === "Angry" ? -4 : em === "Happy" ? -22 : em === "Fear" ? -8 : -18,
+  }).connect(masterChain);
+
+  const snareSynth = new Tone.NoiseSynth({
+    noise:    { type: negHigh ? "white" : "pink" },
+    envelope: { attack: 0.001, decay: 0.10, sustain: 0, release: 0.05 },
+    volume:   negHigh ? -10 : -24,
+  }).connect(masterChain);
+
+  // Hi-hat: lower resonance and volume
+  const hihatSynth = new Tone.MetalSynth({
+    frequency:       300,
+    envelope:        { attack: 0.002, decay: 0.06, release: 0.01 },
+    harmonicity:     5.1,
+    modulationIndex: 16,   // was 32 — less metallic ring
+    resonance:       2000, // was 4000
+    octaves:         1.2,
+    volume:          -30,  // was -22
+  }).connect(masterChain);
+  _effectNodes.push(kickSynth, snareSynth, hihatSynth);
+
+  // GM drum note → synth mapping
+  const KICK_NOTES  = new Set([35, 36]);
+  const SNARE_NOTES = new Set([38, 40]);
+  const HIHAT_NOTES = new Set([42, 44, 46, 51, 56, 70, 75]);
+  const CRASH_NOTES = new Set([49, 57]);
+
+  // ── Schedule notes ────────────────────────────────────────────────────────
   let maxTime = 0;
   scheduledNotes.forEach(({ time, duration, note, channel }) => {
     const toneNote = midiNoteToName(note);
     const beats    = time / 4;
-    const durBeats = Math.max(duration / 4, 0.1);
-    if (channel === 2) {
-      Tone.Transport.schedule(t => { try { bassSynth.triggerAttackRelease(toneNote, durBeats + "n", t); } catch(e){} }, beats + "n");
+    const durSec   = (duration / 4) * (60 / toneBpm);
+    const durStr   = Math.max(durSec, 0.05).toFixed(3);
+
+    if (channel === 9) {
+      // Percussion
+      if (KICK_NOTES.has(note)) {
+        Tone.Transport.schedule(t => { try { kickSynth.triggerAttackRelease("C1", "8n", t); } catch(e){} }, beats + "n");
+      } else if (SNARE_NOTES.has(note)) {
+        Tone.Transport.schedule(t => { try { snareSynth.triggerAttackRelease("8n", t); } catch(e){} }, beats + "n");
+      } else if (CRASH_NOTES.has(note)) {
+        Tone.Transport.schedule(t => { try { hihatSynth.triggerAttackRelease(durStr, t); } catch(e){} }, beats + "n");
+      } else {
+        Tone.Transport.schedule(t => { try { hihatSynth.triggerAttackRelease(durStr, t); } catch(e){} }, beats + "n");
+      }
+    } else if (channel === 2) {
+      Tone.Transport.schedule(t => {
+        try { bassSynth.triggerAttackRelease(toneNote, durStr, t); } catch(e){}
+      }, beats + "n");
+    } else if (channel === 1) {
+      Tone.Transport.schedule(t => {
+        try { chordSynth.triggerAttackRelease(toneNote, durStr, t); } catch(e){}
+      }, beats + "n");
     } else {
-      const s = channel === 0 ? synth : chordSynth;
-      Tone.Transport.schedule(t => { try { s.triggerAttackRelease(toneNote, durBeats + "n", t); } catch(e){} }, beats + "n");
+      Tone.Transport.schedule(t => {
+        try { synth.triggerAttackRelease(toneNote, durStr, t); } catch(e){}
+      }, beats + "n");
     }
     maxTime = Math.max(maxTime, time + duration);
   });
 
   playDuration  = (maxTime / 4 / toneBpm) * 60;
   playStartTime = Tone.now();
+
+  // Configure Transport loop to match UI state
+  Tone.Transport.loop      = isLooping;
+  Tone.Transport.loopStart = 0;
+  if (isLooping) Tone.Transport.loopEnd = playDuration + "s";
+
   Tone.Transport.start();
   isPlaying = true; btnPlay.textContent = "■";
 
   function animateProgress() {
     if (!isPlaying) return;
-    const pct = Math.min((Tone.now() - playStartTime) / playDuration * 100, 100);
+    const elapsed = Tone.now() - playStartTime;
+    const pct = isLooping
+      ? ((elapsed % playDuration) / playDuration * 100)
+      : Math.min(elapsed / playDuration * 100, 100);
     progressFill.style.width = pct + "%";
-    if (pct >= 100) { isPlaying = false; btnPlay.textContent = "▶"; progressFill.style.width = "0%"; return; }
+    if (!isLooping && pct >= 100) {
+      isPlaying = false;
+      btnPlay.textContent = "▶";
+      progressFill.style.width = "0%";
+      stopVisualizer();
+      return;
+    }
     rafId = requestAnimationFrame(animateProgress);
   }
   animateProgress();
   animateWaveform();
 });
 
-// ── Waveform ──────────────────────────────────────────────────────────────────
+// ── Visualizer — emotion-reactive multi-layer canvas ─────────────────────────
 function animateWaveform() {
-  const ctx = waveCanvas.getContext("2d");
-  waveCanvas.width  = waveCanvas.offsetWidth  * (window.devicePixelRatio||1);
-  waveCanvas.height = waveCanvas.offsetHeight * (window.devicePixelRatio||1);
-  ctx.scale(window.devicePixelRatio||1, window.devicePixelRatio||1);
+  const canvas = waveCanvas;
+  const ctx    = canvas.getContext("2d");
+
+  function resize() {
+    canvas.width  = canvas.offsetWidth  * (window.devicePixelRatio || 1);
+    canvas.height = canvas.offsetHeight * (window.devicePixelRatio || 1);
+    ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+  }
+  resize();
+
   if (!toneAnalyser) {
-    toneAnalyser = new Tone.Analyser("waveform", 256);
+    toneAnalyser = new Tone.Analyser("waveform", 512);
     Tone.Destination.connect(toneAnalyser);
   }
+
+  // Frequency analyser for the bloom/particle layer
+  if (!window._freqAnalyser) {
+    window._freqAnalyser = new Tone.Analyser("fft", 64);
+    Tone.Destination.connect(window._freqAnalyser);
+  }
+
+  const v = currentEmotion.valence;
+  const a = currentEmotion.arousal;
+
+  // Derive colour palette from emotion — read live each frame so it
+  // updates if a new clip is analysed while the previous one is playing
+  function emotionColors() {
+    const cv = currentEmotion.valence;
+    const ca = currentEmotion.arousal;
+    if (cv > 0.2  && ca > 0.5)  return { line: "#f5c842", glow: "#f5a800", bg: "rgba(245,168,0,0.04)",  particle: "#ffe08a" };
+    if (cv > 0.2  && ca <= 0.5) return { line: "#7dd4a8", glow: "#3db87a", bg: "rgba(61,184,122,0.04)", particle: "#a8f0cc" };
+    if (cv < -0.2 && ca > 0.5)  return { line: "#e06060", glow: "#c03030", bg: "rgba(192,48,48,0.04)",  particle: "#f09090" };
+    if (cv < -0.2 && ca <= 0.5) return { line: "#7090c8", glow: "#3060a8", bg: "rgba(48,96,168,0.04)",  particle: "#a0c0f0" };
+    return { line: "#c8a96e", glow: "#a07840", bg: "rgba(160,120,64,0.04)", particle: "#e8cfa0" };
+  }
+
+  let frameId;
+  let particlePool = Array.from({ length: 28 }, () => ({
+    x: Math.random(), y: Math.random(), vx: 0, vy: 0, life: Math.random(), size: 1 + Math.random() * 2,
+  }));
+
   function draw() {
     if (!isPlaying) {
-      ctx.clearRect(0,0,waveCanvas.offsetWidth,waveCanvas.offsetHeight);
-      ctx.strokeStyle="#1e2535"; ctx.lineWidth=1.5; ctx.beginPath();
-      ctx.moveTo(0,waveCanvas.offsetHeight/2); ctx.lineTo(waveCanvas.offsetWidth,waveCanvas.offsetHeight/2);
-      ctx.stroke(); return;
+      ctx.clearRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
+      // Draw flat idle line
+      ctx.strokeStyle = "#1e2535";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(0, canvas.offsetHeight / 2);
+      ctx.lineTo(canvas.offsetWidth, canvas.offsetHeight / 2);
+      ctx.stroke();
+      return;
     }
-    const w=waveCanvas.offsetWidth, h=waveCanvas.offsetHeight, data=toneAnalyser.getValue();
-    ctx.clearRect(0,0,w,h);
-    ctx.strokeStyle="#c8a96e"; ctx.lineWidth=1.5; ctx.shadowColor="#c8a96e"; ctx.shadowBlur=6;
+
+    const w = canvas.offsetWidth;
+    const h = canvas.offsetHeight;
+    const col = emotionColors();
+    const waveData = toneAnalyser.getValue();
+    const freqData = window._freqAnalyser.getValue();
+
+    // Background fade trail
+    ctx.fillStyle = "rgba(8,10,15,0.18)";
+    ctx.fillRect(0, 0, w, h);
+
+    // ── Layer 1: frequency bloom bars (very subtle, behind waveform) ─────────
+    const numBars = 16;
+    const barW    = w / numBars;
+    for (let i = 0; i < numBars; i++) {
+      const fIdx  = Math.floor(i * freqData.length / numBars);
+      // FFT returns dB values, typically -100..0
+      const norm  = Math.max(0, (freqData[fIdx] + 80) / 80);
+      const barH  = norm * h * 0.38;
+      const alpha = norm * 0.18;
+      ctx.fillStyle = col.bg.replace("0.04", alpha.toFixed(2));
+      ctx.fillRect(i * barW, h / 2 - barH / 2, barW - 2, barH);
+    }
+
+    // ── Layer 2: particles drifting upward, triggered by low-freq energy ─────
+    const bassEnergy = freqData.slice(0, 4).reduce((s, v) => s + Math.max(0, v + 100), 0) / 4 / 100;
+    particlePool.forEach(p => {
+      p.life -= 0.012 + a * 0.006;
+      if (p.life <= 0 || bassEnergy > 0.6 * Math.random()) {
+        p.x    = 0.15 + Math.random() * 0.70;
+        p.y    = 0.55 + Math.random() * 0.35;
+        p.vx   = (Math.random() - 0.5) * 0.003;
+        p.vy   = -(0.003 + a * 0.006 + Math.random() * 0.004);
+        p.life = 0.4 + Math.random() * 0.6;
+        p.size = 1 + Math.random() * (2 + a * 2);
+      }
+      p.x += p.vx; p.y += p.vy;
+      const alpha = p.life * 0.65;
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, p.size * p.life, 0, Math.PI * 2);
+      ctx.fillStyle = col.particle + Math.floor(alpha * 255).toString(16).padStart(2, "0");
+      ctx.fill();
+    });
+
+    // ── Layer 3: main waveform line with glow ────────────────────────────────
+    const rmsLive = waveData.reduce((s, v) => s + v * v, 0) / waveData.length;
+    const energy  = Math.sqrt(rmsLive);
+
+    // Outer glow pass
+    ctx.save();
+    ctx.shadowColor = col.glow;
+    ctx.shadowBlur  = 6 + energy * 20;
+    ctx.strokeStyle = col.glow + "55";
+    ctx.lineWidth   = 2.5;
     ctx.beginPath();
-    data.forEach((v,i) => { const x=i*(w/data.length), y=h/2+v*h*0.45; i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
-    ctx.stroke(); ctx.shadowBlur=0;
-    rafId = requestAnimationFrame(draw);
+    waveData.forEach((val, i) => {
+      const x = (i / (waveData.length - 1)) * w;
+      const y = h / 2 + val * h * 0.42;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.restore();
+
+    // Crisp inner line
+    ctx.strokeStyle = col.line;
+    ctx.lineWidth   = 1.8;
+    ctx.shadowBlur  = 0;
+    ctx.beginPath();
+    waveData.forEach((val, i) => {
+      const x = (i / (waveData.length - 1)) * w;
+      const y = h / 2 + val * h * 0.42;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // ── Layer 4: centre peak dot that pulses with energy ─────────────────────
+    const midVal = waveData[Math.floor(waveData.length / 2)];
+    const dotY   = h / 2 + midVal * h * 0.42;
+    const dotR   = 2 + energy * 8;
+    const grad   = ctx.createRadialGradient(w / 2, dotY, 0, w / 2, dotY, dotR * 2);
+    grad.addColorStop(0, col.line);
+    grad.addColorStop(1, "transparent");
+    ctx.beginPath();
+    ctx.arc(w / 2, dotY, dotR, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    frameId = requestAnimationFrame(draw);
   }
-  draw();
+
+  // Expose frameId so the stop path can cancel it
+  rafId = undefined;
+  const origDraw = draw;
+  frameId = requestAnimationFrame(draw);
+  // Override rafId to point at our frameId reference (updated each frame above)
+  Object.defineProperty(window, "_vizFrameId", { get: () => frameId, configurable: true });
+}
+
+// Stop visualizer helper called on playback stop
+function stopVisualizer() {
+  if (window._vizFrameId) cancelAnimationFrame(window._vizFrameId);
 }
 
 // Draw flat line on load
