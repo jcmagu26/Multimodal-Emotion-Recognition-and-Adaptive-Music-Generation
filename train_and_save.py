@@ -95,7 +95,8 @@ print(f"Valence [{df['valence'].min():.3f}, {df['valence'].max():.3f}]  "
 
 audio_cols  = [c for c in df.columns if any(c.startswith(p) for p in
                ('mfcc_','pitch_','voiced_','energy_','spec_','zcr',
-                'hnr','chroma_','mel_','jitter'))]
+                'hnr','cpp','shimmer','chroma_','mel_','jitter',
+                'pause_','lowfreq_','spectral_'))]
 visual_cols = [c for c in df.columns if c.startswith('face_')]
 text_cols   = [c for c in df.columns if c.startswith('text_')]
 all_cols    = audio_cols + visual_cols + text_cols
