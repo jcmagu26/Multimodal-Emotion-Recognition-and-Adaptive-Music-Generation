@@ -28,6 +28,7 @@ resonance/
 ├── train_and_save.py            # Step 4 — train the model and save artifacts
 ├── app.py                       # Step 5 — run the Flask backend
 ├── index.html                   # Frontend UI
+├── requirements.txt
 └── README.md
 ```
 
@@ -43,12 +44,12 @@ Once downloaded, update the file paths at the top of each script to point to you
 
 | Script | Path variable | What it points to |
 |--------|--------------|-------------------|
-| `clean_ground_truth.py` | `INPUT_PATH` | `VideoDemographics.csv` or your VA mapping file |
+| `clean_ground_truth.py` | `INPUT_PATH` | `video_va_mapping_dynamic.csv` |
 | `video_feature_extraction.py` | `mp4_folder`, `audio_folder`, `GT_CSV` | MP4 directory, WAV output directory, cleaned CSV |
 | `transcribe_features.py` | `DEFAULT_FEATURES_CSV` | Output of step 2 |
 | `train_and_save.py` | `WITH_TEXT_CSV` | Output of step 3 |
 | `app.py` | `MODEL_DIR` | Where trained model files are saved |
-
+ 
 ---
 
 ## Installation
@@ -59,7 +60,6 @@ pip install -r requirements.txt
 
 You will also need:
 - **ffmpeg** — for extracting audio from video files (`brew install ffmpeg` on macOS)
-- **FluidSynth** — optional, for rendering MIDI to WAV (`brew install fluidsynth` on macOS)
 
 ---
 
@@ -143,10 +143,3 @@ See `requirements.txt`. Key libraries:
 - `openai-whisper` — speech transcription (optional, improves valence prediction)
 
 ---
-
-## References
-
-- Cao et al. (2014). CREMA-D: Crowd-sourced Emotional Multimodal Actors Dataset. *IEEE Transactions on Affective Computing*.
-- Pasquier et al. (2025). MIDI-GPT: A Controllable Generative Model for Computer-Assisted Multitrack Music Composition. arXiv:2501.17011.
-- Wang et al. (2024). Multimodal Music Generation with Explicit Bridges and Retrieval Augmentation. arXiv:2412.09428.
-- Russell, J. A. (1980). A circumplex model of affect. *Journal of Personality and Social Psychology*, 39(6), 1161–1178.
