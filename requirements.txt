@@ -1,0 +1,12 @@
+flask
+flask-cors
+librosa
+opencv-python
+mediapipe
+torch
+scikit-learn
+pandas
+numpy
+joblib
+midiutil
+openai-whisper
