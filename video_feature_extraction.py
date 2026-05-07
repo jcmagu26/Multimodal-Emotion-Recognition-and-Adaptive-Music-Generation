@@ -98,7 +98,7 @@ for idx, row in va_mapping.iterrows():
 
     try:
         extract_wav(mp4_file, wav_file)
-        y, sr = librosa.load(wav_file, sr=None)
+        y, sr = librosa.load(wav_file, sr=16000)
     except Exception as e:
         print(f"  SKIP: {e}"); continue
 
